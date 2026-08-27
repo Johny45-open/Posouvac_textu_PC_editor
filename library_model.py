@@ -71,6 +71,7 @@ def load_library_from_folder(folder: str) -> tuple[bool, list[dict] | str]:
 
 
 def enrich_with_csv(entries: list[dict], csv_entries: list[dict]) -> None:
+    """Doplní duration podle CSV (match artist+title). Modifikuje in-place."""
     def norm(s): return re.sub(r'\s+', ' ', (s or "").strip().lower())
     csv_by_title = {}
     csv_by_full = {}
@@ -92,6 +93,45 @@ def enrich_with_csv(entries: list[dict], csv_entries: list[dict]) -> None:
                 e["duration"] = src["duration"]
             if src.get("tempo") and not e.get("tempo"):
                 e["tempo"] = src.get("tempo")
+
+
+def enrich_imported_songs(imported: list[dict], library: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Obohatí importované písně z Generatoru o metadata z knihovny. Vrací (enriched, missing)."""
+    def norm(s): return re.sub(r'\s+', ' ', (s or "").strip().lower())
+    
+    # map knihovny
+    lib_map = {}
+    for entry in library:
+        t = norm(entry.get("title"))
+        a = norm(entry.get("artist"))
+        lib_map[f"{a}|{t}"] = entry
+        lib_map[t] = entry # fallback
+
+    enriched = []
+    missing = []
+    for imp in imported:
+        t = norm(imp.get("title"))
+        a = norm(imp.get("artist"))
+        key = f"{a}|{t}"
+        match = lib_map.get(key) or lib_map.get(t)
+        
+        if match:
+            # Obohatit
+            enriched.append({
+                "title": imp.get("title"),
+                "artist": imp.get("artist"),
+                "duration": imp.get("duration") or match.get("duration"),
+                "tempo": imp.get("tempo") or match.get("tempo"),
+                "content": imp.get("content") or match.get("content"),
+                "stopMarks": imp.get("stopMarks") or match.get("stopMarks") or [],
+                "filePath": match.get("filePath")
+            })
+        else:
+            missing.append(imp)
+            # Přidat i tak, ale bez filePath/stopMarks
+            enriched.append(imp)
+            
+    return enriched, missing
 
 
 def save_entry_to_file(entry: dict) -> tuple[bool, str]:

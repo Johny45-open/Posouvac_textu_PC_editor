@@ -46,7 +46,6 @@ class EditSetlistSongDialog(QDialog):
         self.tempo_input.setPlaceholderText("30–300 BPM, prázdné = bez tempa")
         layout.addRow("Tempo:", self.tempo_input)
 
-        # info o zarážkách – jen zobrazení, editace přes hlavní dialog
         marks = song_dict.get("stopMarks") or []
         self.marks_info = QLabel(f"{len(marks)} zarážek" if marks else "Žádné zarážky")
         self.marks_info.setAccessibleName("Počet zarážek")
@@ -91,7 +90,6 @@ class QRDialog(QDialog):
                 qr.add_data(payload)
                 qr.make(fit=True)
                 img = qr.make_image(fill_color="black", back_color="white")
-                # PIL → QPixmap
                 try:
                     from PIL import ImageQt  # type: ignore
                     qimg = ImageQt.ImageQt(img)
@@ -138,7 +136,15 @@ class PCEditorApp(QMainWindow):
         self.current_library_index: int = -1
         self.output_folder: str = ""
         self.source_folder: str = ""
+        self.live_label = QLabel("")
+        self.live_label.setAccessibleName("")
+        self.live_label.setProperty("accessibleLiveRegion", "polite")
         self.init_ui()
+
+    def announce(self, msg):
+        self.statusBar().showMessage(msg, 4000)
+        self.live_label.setText(msg)
+        self.live_label.setAccessibleName(msg)
 
     def init_ui(self):
         central = QWidget()
@@ -152,6 +158,17 @@ class PCEditorApp(QMainWindow):
         self.open_folder_btn.setAccessibleDescription("Vyberte složku obsahující .txt soubory s texty písní. Lze i rekurzivně.")
         self.open_folder_btn.clicked.connect(self.open_folder)
         top_row.addWidget(self.open_folder_btn)
+
+        self.import_gen_btn = QPushButton("Import z Generátoru (&G)")
+        self.import_gen_btn.setAccessibleName("Importovat setlist z Generátoru")
+        self.import_gen_btn.setAccessibleDescription("Importuje JSON playlist z programu Generátor playlistu.")
+        self.import_gen_btn.clicked.connect(self.import_from_generator)
+        top_row.addWidget(self.import_gen_btn)
+
+        self.merge_check = QCheckBox("Přidat k setlistu")
+        self.merge_check.setAccessibleName("Přidat importované písně k aktuálnímu setlistu místo nahrazení")
+        self.merge_check.setChecked(True)
+        top_row.addWidget(self.merge_check)
 
         self.load_csv_btn = QPushButton("Načíst knihovnu CSV (&C)")
         self.load_csv_btn.setAccessibleName("Načíst knihovnu CSV")
@@ -173,6 +190,7 @@ class PCEditorApp(QMainWindow):
         self.status_label.setAccessibleName("Stav")
         self.status_label.setWordWrap(True)
         main_layout.addWidget(self.status_label)
+        main_layout.addWidget(self.live_label)
 
         # --- Splitter: knihovna vlevo, pravý panel ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -399,7 +417,8 @@ class PCEditorApp(QMainWindow):
         self.statusBar().showMessage("Připraven. Otevřete složku s písněmi.")
 
         # Tab order
-        self.setTabOrder(self.open_folder_btn, self.load_csv_btn)
+        self.setTabOrder(self.open_folder_btn, self.import_gen_btn)
+        self.setTabOrder(self.import_gen_btn, self.load_csv_btn)
         self.setTabOrder(self.load_csv_btn, self.output_btn)
         self.setTabOrder(self.output_btn, self.filter_input)
         self.setTabOrder(self.filter_input, self.library_list)
@@ -417,7 +436,6 @@ class PCEditorApp(QMainWindow):
         if not folder:
             return
         self.source_folder = folder
-        # výstupní složka default: <zdroj>_upraveno
         if not self.output_folder:
             self.output_folder = folder.rstrip("\\/") + "_upraveno"
         ok, data = library_model.load_library_from_folder(folder)
@@ -425,13 +443,38 @@ class PCEditorApp(QMainWindow):
             QMessageBox.critical(self, "Chyba", str(data))
             return
         self.library = data
-        # obohatit CSV pokud načteno dříve
         if self.csv_library:
             library_model.enrich_with_csv(self.library, self.csv_library)
         self.refresh_library_list()
-        self.statusBar().showMessage(f"Načteno {len(self.library)} písní z {folder}. Výstup: {self.output_folder}")
+        self.announce(f"Načteno {len(self.library)} písní z {folder}.")
         self.status_label.setText(f"Zdroj: {folder}  →  Výstup: {self.output_folder}  |  {len(self.library)} písní  |  {len(self.setlist)} v setlistu")
         self.save_detail_btn.setEnabled(bool(self.library))
+
+    def import_from_generator(self):
+        fn, _ = QFileDialog.getOpenFileName(self, "Import setlistu z Generátoru", 
+            "C:/Honza/Projekty/Generator_playlistu_pro_Posouvac_textu", "JSON (*.json)")
+        if not fn:
+            return
+        ok, data = playlist_backend.load_playlist(fn)
+        if not ok:
+            QMessageBox.critical(self, "Chyba", f"Nepodařilo se načíst playlist: {data}")
+            return
+        
+        raw_songs = data.get("_normSongs") or data.get("songs") or []
+        enriched, missing = library_model.enrich_imported_songs(raw_songs, self.library)
+        
+        if self.merge_check.isChecked():
+            self.setlist.extend(enriched)
+        else:
+            self.setlist = enriched
+            self.setlist_name_input.setText(data.get("name") or Path(fn).stem)
+        
+        self.refresh_setlist()
+        self.announce(f"Importováno {len(enriched)} písní z {data.get('name')}. Chybějících v knihovně: {len(missing)}.")
+        if missing:
+            msg = "\n".join([f"{m.get('artist')} - {m.get('title')}" for m in missing[:10]])
+            if len(missing) > 10: msg += "\n..."
+            QMessageBox.information(self, "Chybějící v knihovně", f"Písně nebyly nalezeny v knihovně (budou přidány bez filePath/zarážek):\n{msg}")
 
     def load_csv(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Načíst metadata_pisni.csv", "", "CSV (*.csv);;Vše (*)")
@@ -445,14 +488,14 @@ class PCEditorApp(QMainWindow):
         if self.library:
             library_model.enrich_with_csv(self.library, self.csv_library)
             self.refresh_library_list()
-        self.statusBar().showMessage(f"CSV knihovna: {len(data)} písní. Délky doplněny do knihovny.")
+        self.announce(f"Knihovna načtena: {len(data)} písní.")
         self.status_label.setText(f"CSV: {len(data)} písní. " + self.status_label.text())
 
     def choose_output_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Vyberte výstupní složku (kopíruje se do telefonu)")
+        folder = QFileDialog.getExistingDirectory(self, "Vyberte výstupní složku")
         if folder:
             self.output_folder = folder
-            self.statusBar().showMessage(f"Výstupní složka: {folder}")
+            self.announce(f"Výstupní složka: {folder}")
             self.status_label.setText(f"Výstup: {folder}")
 
     def refresh_library_list(self):
@@ -472,8 +515,6 @@ class PCEditorApp(QMainWindow):
             self.library_list.addItem(item)
             count += 1
         self.lib_count_label.setText(f"Zobrazeno {count} / {len(self.library)} písní")
-        if count == 0 and filt:
-            self.statusBar().showMessage(f"Filtr „{filt}“ – žádná píseň.")
 
     def on_library_selection(self):
         items = self.library_list.selectedItems()
@@ -489,11 +530,8 @@ class PCEditorApp(QMainWindow):
         self.title_input.setText(entry.get('title') or "")
         self.dur_input.setText(playlist_backend.format_duration(entry['duration']) if entry.get('duration') else "")
         self.tempo_input.setText(str(int(entry['tempo'])) if entry.get('tempo') else "")
-        # náhled
         content = entry.get('content') or ""
-        # zvýraznit zarážky v náhledu
-        preview = content[:4000]
-        self.preview_text.setPlainText(preview)
+        self.preview_text.setPlainText(content[:4000])
         self.tabs.setCurrentIndex(0)
         self.statusBar().showMessage(f"Vybrána: {entry.get('artist')} – {entry.get('title')} – {len(entry.get('stopMarks') or [])} zarážek")
 
@@ -514,26 +552,22 @@ class PCEditorApp(QMainWindow):
         if dur_raw and dur_raw != "?":
             duration = playlist_backend.parse_duration(dur_raw)
             if duration is None:
-                QMessageBox.warning(self, "Varování", "Neplatná délka. Použijte m:ss (např. 3:30) nebo sekundy.")
+                QMessageBox.warning(self, "Varování", "Neplatná délka.")
                 return
         if tempo_raw:
             tempo = playlist_backend.parse_tempo(tempo_raw)
             if tempo is None:
                 QMessageBox.warning(self, "Varování", "Tempo musí být 30–300 BPM.")
                 return
-        # aktualizovat entry
         entry["artist"] = new_artist
         entry["title"] = new_title
         entry["duration"] = duration
         entry["tempo"] = tempo
-        # zarážky už jsou v entry["stopMarks"], content se přepíše až při save_all / save_entry
-        # pro okamžitý náhled přepočítej direktivy do content (neukládej na disk hned)
         entry["content"] = playlist_backend.file_content_with_stop_marks_applied(entry.get("content") or "", entry.get("stopMarks") or [])
         self.preview_text.setPlainText(entry["content"][:4000])
         self.refresh_library_list()
-        self.refresh_setlist()  # pokud je píseň i v setlistu, aktualizovat zobrazení
-        self.statusBar().showMessage(f"Uloženo v paměti: {new_artist} – {new_title}. Pro zápis na disk použijte Uložit vše.")
-        # označit, že je potřeba uložit
+        self.refresh_setlist()
+        self.announce(f"Uloženo v paměti: {new_artist} – {new_title}. Pro zápis na disk použijte Uložit vše.")
         self._mark_dirty()
 
     def open_stops_dialog(self):
@@ -543,19 +577,16 @@ class PCEditorApp(QMainWindow):
         entry = self.library[self.current_library_index]
         dlg = StopMarksDialog(entry, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            # stopMarks už upraveno in-place
-            # aktualizovat content náhled
             entry["content"] = playlist_backend.file_content_with_stop_marks_applied(entry.get("content") or "", entry.get("stopMarks") or [])
             self.preview_text.setPlainText(entry["content"][:4000])
             self.refresh_library_list()
-            # propagovat do setlistu pokud tam píseň je
             for s in self.setlist:
                 if s.get("filePath") == entry.get("filePath") or (s.get("title") == entry.get("title") and s.get("artist") == entry.get("artist")):
                     s["stopMarks"] = list(entry.get("stopMarks") or [])
                     s["content"] = entry["content"]
             self.refresh_setlist()
             self._mark_dirty()
-            self.statusBar().showMessage(f"Zarážky uloženy v paměti ({len(entry.get('stopMarks') or [])} zarážek). Použijte Uložit vše pro zápis na disk.")
+            self.announce(f"Zarážky uloženy v paměti ({len(entry.get('stopMarks') or [])} zarážek).")
 
     def _mark_dirty(self):
         self.save_all_btn.setStyleSheet("font-weight: bold;")
@@ -563,7 +594,6 @@ class PCEditorApp(QMainWindow):
     # --- Setlist ---
     def add_to_setlist(self):
         if self.current_library_index < 0:
-            # zkusit podle výběru
             items = self.library_list.selectedItems()
             if not items:
                 QMessageBox.warning(self, "Varování", "Vyberte píseň v knihovně vlevo.")
@@ -573,7 +603,6 @@ class PCEditorApp(QMainWindow):
         entry = self.library[self.current_library_index] if 0 <= self.current_library_index < len(self.library) else None
         if not entry:
             return
-        # kopie pro setlist (aby tempo/délka v setlistu mohly být jiné než globální)
         copy = {
             "title": entry["title"],
             "artist": entry["artist"],
@@ -585,7 +614,7 @@ class PCEditorApp(QMainWindow):
         }
         self.setlist.append(copy)
         self.refresh_setlist()
-        self.statusBar().showMessage(f"Přidána do setlistu: {copy['artist']} – {copy['title']}")
+        self.announce(f"Přidána do setlistu: {copy['artist']} – {copy['title']}")
 
     def remove_from_setlist(self):
         row = self.setlist_list.currentRow()
@@ -594,7 +623,7 @@ class PCEditorApp(QMainWindow):
             return
         removed = self.setlist.pop(row)
         self.refresh_setlist()
-        self.statusBar().showMessage(f"Odebrána: {removed.get('title')}")
+        self.announce(f"Odebrána: {removed.get('title')}")
 
     def move_setlist(self, delta: int):
         row = self.setlist_list.currentRow()
@@ -605,7 +634,7 @@ class PCEditorApp(QMainWindow):
             self.setlist.insert(new_row, self.setlist.pop(row))
             self.refresh_setlist()
             self.setlist_list.setCurrentRow(new_row)
-            self.statusBar().showMessage(f"Přesunuta na {new_row+1}. místo")
+            self.announce(f"Přesunuta na {new_row+1}. místo")
 
     def on_setlist_reordered(self, *args):
         new_order = []
@@ -631,7 +660,7 @@ class PCEditorApp(QMainWindow):
                 return
             self.setlist[row] = res
             self.refresh_setlist()
-            self.statusBar().showMessage(f"Upravena: {res.get('title')}")
+            self.announce(f"Upravena: {res.get('title')}")
 
     def refresh_setlist(self):
         self.setlist_list.clear()
@@ -661,7 +690,7 @@ class PCEditorApp(QMainWindow):
             else:
                 txt = f"{len(self.setlist)} písní • Celkový čas: {m}:{sec:02d} + {unknown} bez času (odhad +{unknown*3} min)"
             self.summary_label.setText(txt)
-        self.refresh_library_list()  # aktualizovat count?
+        self.refresh_library_list()
 
     # --- Exporty ---
     def _require_setlist(self) -> bool:
@@ -683,30 +712,22 @@ class PCEditorApp(QMainWindow):
         return folder
 
     def save_all(self):
-        """Zapíše všechny upravené .txt (s direktivami) + JSON setlistu."""
         if not self._require_setlist():
             return
         folder = self._ensure_output_folder()
         if not folder:
             return
-        # 1) zapsat všechny knihovní soubory s aktuálními stopMarks
         ok_count = 0
         fail = []
         for entry in self.library:
-            # pouze pokud má filePath
             if not entry.get("filePath"):
                 continue
-            # cílový soubor: ve výstupní složce zachovat jméno
-            # pokud zdroj == cíl, přepiš in-place, jinak zkopíruj do výstupu
             src = entry["filePath"]
-            # Pokud výstup != zdroj, vytvoř kopii s novým jménem podle aktuálních metadat
             if os.path.abspath(folder) != os.path.abspath(os.path.dirname(src)):
-                # název podle aktuálního artist-title
                 safe_a = "".join(c if c not in r'\/:*?"<>|' else "_" for c in (entry.get("artist") or "")).strip()
                 safe_t = "".join(c if c not in r'\/:*?"<>|' else "_" for c in (entry.get("title") or "")).strip()
                 fname = f"{safe_a} - {safe_t}.txt" if safe_a else f"{safe_t}.txt"
                 dst = os.path.join(folder, fname)
-                # obsah s direktivami
                 content = playlist_backend.file_content_with_stop_marks_applied(entry.get("content") or "", entry.get("stopMarks") or [])
                 try:
                     os.makedirs(folder, exist_ok=True)
@@ -721,17 +742,13 @@ class PCEditorApp(QMainWindow):
                     ok_count += 1
                 else:
                     fail.append(msg)
-        # 2) uložit JSON setlistu
         name = self.setlist_name_input.text().strip()
         include_texts = self.save_with_texts_check.isChecked()
-        # pro JSON použij setlist (již obsahuje stopMarks)
         json_path = os.path.join(folder, f"{name.replace(' ', '_')}.json")
-        # zajistit content pokud include_texts
         export_songs = []
         for s in self.setlist:
             e = dict(s)
             if include_texts and not e.get("content"):
-                # zkusit z library podle filePath
                 for lib in self.library:
                     if lib.get("filePath") == e.get("filePath"):
                         e["content"] = lib.get("content")
@@ -743,13 +760,12 @@ class PCEditorApp(QMainWindow):
         if not success:
             QMessageBox.critical(self, "Chyba", f"JSON se nepodařilo uložit: {result}")
             return
-        msg = f"Uloženo {ok_count} textů do {folder} a setlist {result} ({'s texty' if include_texts else 'bez textů'})."
+        msg = f"Uloženo {ok_count} textů a setlist {result}."
         if fail:
             msg += f"\nChyby: {', '.join(fail[:3])}"
-        QMessageBox.information(self, "Uloženo", msg + "\n\nZkopírujte obsah složky přes USB do Telefon\\Download\\Posouvac\\ a v telefonu importujte.")
-        self.statusBar().showMessage(msg)
+        QMessageBox.information(self, "Uloženo", msg + "\n\nZkopírujte do telefonu.")
+        self.announce(msg)
         self.save_all_btn.setStyleSheet("")
-        # otevřít složku
         try:
             QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
         except Exception:
@@ -777,8 +793,8 @@ class PCEditorApp(QMainWindow):
         json_path = os.path.join(folder, f"{name.replace(' ', '_')}.json")
         success, result = playlist_backend.save_playlist_to(json_path, name, export_songs)
         if success:
-            QMessageBox.information(self, "Uloženo", f"Setlist uložen do:\n{result}\n\nZkopírujte přes USB do telefonu.")
-            self.statusBar().showMessage(f"Setlist uložen: {result}")
+            QMessageBox.information(self, "Uloženo", f"Setlist uložen do:\n{result}\n\nZkopírujte přes USB.")
+            self.announce(f"Setlist uložen: {result}")
             QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
         else:
             QMessageBox.critical(self, "Chyba", result)
@@ -807,7 +823,7 @@ class PCEditorApp(QMainWindow):
             QMessageBox.warning(self, "QR příliš velký", f"{err}\n\nPoužijte soubor JSON.")
             return
         if not HAS_QRCODE:
-            QMessageBox.warning(self, "Chybí qrcode", "Nainstalujte pip install qrcode[pil]. Mezitím použijte soubor nebo schránku.")
+            QMessageBox.warning(self, "Chybí qrcode", "Nainstalujte pip install qrcode[pil].")
             QApplication.clipboard().setText(payload)
             return
         dlg = QRDialog(payload, self)
@@ -822,7 +838,7 @@ class PCEditorApp(QMainWindow):
             QMessageBox.critical(self, "Chyba", "Nepodařilo se sestavit JSON.")
             return
         QApplication.clipboard().setText(text)
-        self.statusBar().showMessage("Setlist zkopírován do schránky – vložte do zprávy.")
+        self.announce("Setlist zkopírován do schránky.")
         QMessageBox.information(self, "Zkopírováno", "Setlist zkopírován jako JSON do schránky.")
 
 
