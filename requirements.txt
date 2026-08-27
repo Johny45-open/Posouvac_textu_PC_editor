@@ -1,3 +1,4 @@
 PyQt6>=6.6
 qrcode[pil]>=7.0
 Pillow>=10.0
+accessible_output2>=0.18

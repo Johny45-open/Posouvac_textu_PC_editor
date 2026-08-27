@@ -10,12 +10,14 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QFormLayout, QSpinBox, QGroupBox, QSplitter, QTabWidget,
     QTextEdit, QCheckBox
 )
-from PyQt6.QtCore import Qt, QUrl, QStringListModel
+from PyQt6.QtCore import Qt, QUrl, QStringListModel, QSettings
 from PyQt6.QtGui import QDesktopServices
 
 import playlist_backend
 import library_model
 import song_parser
+import diacritic
+import tts
 from stop_marks_editor import StopMarksDialog
 
 try:
@@ -136,15 +138,29 @@ class PCEditorApp(QMainWindow):
         self.current_library_index: int = -1
         self.output_folder: str = ""
         self.source_folder: str = ""
+        self.diacritic_map: dict = {}
+        self.diacritic_info: dict = {}
+        self.diacritic_path: str = ""
         self.live_label = QLabel("")
         self.live_label.setAccessibleName("")
         self.live_label.setProperty("accessibleLiveRegion", "polite")
+        # hlas
+        self.settings = QSettings("Posouvac", "PCEditor")
+        voice_enabled = self.settings.value("voiceConfirm", True)
+        # QSettings vrací string na některých platformách
+        if isinstance(voice_enabled, str):
+            voice_enabled = voice_enabled.lower() in ("true", "1", "yes")
+        tts.set_enabled(bool(voice_enabled))
         self.init_ui()
 
     def announce(self, msg):
         self.statusBar().showMessage(msg, 4000)
         self.live_label.setText(msg)
         self.live_label.setAccessibleName(msg)
+        try:
+            tts.speak(msg)
+        except Exception:
+            pass
 
     def init_ui(self):
         central = QWidget()
@@ -185,6 +201,49 @@ class PCEditorApp(QMainWindow):
 
         top_row.addStretch()
         main_layout.addLayout(top_row)
+
+        # --- Druhá lišta: slovník + hlas ---
+        dia_row = QHBoxLayout()
+        self.load_diacritic_btn = QPushButton("Načíst slovník (&K)")
+        self.load_diacritic_btn.setAccessibleName("Načíst slovník diakritiky")
+        self.load_diacritic_btn.setAccessibleDescription("Vyberte CSV slovník bezDiakritiky,sDiakritikou exportovaný z telefonu. Libovolný název souboru.")
+        self.load_diacritic_btn.setToolTip("Telefon: Nastavení → Slovník diakritiky → Exportovat slovník. Na PC vyberte libovolný *.csv.")
+        self.load_diacritic_btn.clicked.connect(self.load_diacritic_csv)
+        dia_row.addWidget(self.load_diacritic_btn)
+
+        self.repair_diacritic_btn = QPushButton("Opravit diakritiku – náhled… (&D)")
+        self.repair_diacritic_btn.setAccessibleName("Opravit diakritiku – náhled")
+        self.repair_diacritic_btn.setAccessibleDescription("Zobrazí náhled oprav podle slovníku, umožní potvrdit a přejmenovat soubory.")
+        self.repair_diacritic_btn.clicked.connect(self.show_diacritic_preview)
+        self.repair_diacritic_btn.setEnabled(False)
+        dia_row.addWidget(self.repair_diacritic_btn)
+
+        self.diacritic_status = QLabel("Slovník: nenačten")
+        self.diacritic_status.setAccessibleName("Stav slovníku diakritiky")
+        self.diacritic_status.setWordWrap(True)
+        dia_row.addWidget(self.diacritic_status, 1)
+
+        self.voice_check = QCheckBox("Hlasové potvrzení")
+        self.voice_check.setAccessibleName("Hlasové potvrzení")
+        self.voice_check.setAccessibleDescription("Když zapnuto, aplikace hlásí akce přes čtečku obrazovky (NVDA/JAWS) nebo SAPI, pomocí accessible_output2 Auto().")
+        # sync s QSettings – reuse voice_enabled z __init__
+        try:
+            ve = self.settings.value("voiceConfirm", True)
+            if isinstance(ve, str):
+                ve = ve.lower() in ("true", "1", "yes")
+            self.voice_check.setChecked(bool(ve))
+        except Exception:
+            self.voice_check.setChecked(True)
+        self.voice_check.toggled.connect(self.on_voice_toggled)
+        dia_row.addWidget(self.voice_check)
+
+        self.voice_test_btn = QPushButton("Zkouška hlasu")
+        self.voice_test_btn.setAccessibleName("Zkouška hlasového výstupu")
+        self.voice_test_btn.clicked.connect(lambda: tts.speak("Zkouška hlasového výstupu. Slovník obsahuje {} záznamů.".format(len(self.diacritic_map)) if self.diacritic_map else "Zkouška hlasového výstupu."))
+        dia_row.addWidget(self.voice_test_btn)
+
+        dia_row.addStretch()
+        main_layout.addLayout(dia_row)
 
         self.status_label = QLabel("Začněte: Otevřít složku s písněmi nebo Načíst CSV.")
         self.status_label.setAccessibleName("Stav")
@@ -449,6 +508,11 @@ class PCEditorApp(QMainWindow):
         self.announce(f"Načteno {len(self.library)} písní z {folder}.")
         self.status_label.setText(f"Zdroj: {folder}  →  Výstup: {self.output_folder}  |  {len(self.library)} písní  |  {len(self.setlist)} v setlistu")
         self.save_detail_btn.setEnabled(bool(self.library))
+        # povolit náhled diakritiky pokud je slovník
+        try:
+            self.repair_diacritic_btn.setEnabled(bool(self.library) and bool(self.diacritic_map))
+        except Exception:
+            pass
 
     def import_from_generator(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Import setlistu z Generátoru", 
@@ -490,6 +554,197 @@ class PCEditorApp(QMainWindow):
             self.refresh_library_list()
         self.announce(f"Knihovna načtena: {len(data)} písní.")
         self.status_label.setText(f"CSV: {len(data)} písní. " + self.status_label.text())
+
+    def on_voice_toggled(self, checked: bool):
+        tts.set_enabled(bool(checked))
+        try:
+            self.settings.setValue("voiceConfirm", bool(checked))
+        except Exception:
+            pass
+        self.announce("Hlasové potvrzení zapnuto." if checked else "Hlasové potvrzení vypnuto.")
+
+    def load_diacritic_csv(self):
+        fn, _ = QFileDialog.getOpenFileName(self, "Načíst slovník diakritiky", "", "CSV (*.csv);;Vše (*)")
+        if not fn:
+            return
+        ok, dmap, info = diacritic.load_diacritic_csv(fn)
+        if not ok:
+            QMessageBox.critical(self, "Chyba", f"Slovník se nepodařilo načíst: {dmap}")
+            self.announce(f"Chyba načtení slovníku: {dmap}")
+            return
+        self.diacritic_map = dmap
+        self.diacritic_info = info
+        self.diacritic_path = fn
+        imp = info.get("imported", 0)
+        skip = info.get("skipped", 0)
+        self.diacritic_status.setText(f"Slovník: {Path(fn).name} – {len(dmap)} záznamů (import {imp}, přeskočeno {skip})")
+        self.repair_diacritic_btn.setEnabled(bool(self.library) and bool(self.diacritic_map))
+        msg = f"Slovník načten: {len(dmap)} záznamů z {Path(fn).name}. Import {imp}, přeskočeno {skip}."
+        if info.get("errors"):
+            # stručně
+            msg += f" Chyby: {len(info['errors'])}"
+        self.announce(msg)
+        self.status_label.setText(msg + " | " + self.status_label.text())
+
+    def show_diacritic_preview(self):
+        if not self.library:
+            QMessageBox.warning(self, "Varování", "Nejprve otevřete složku s písněmi.")
+            self.announce("Nejprve otevřete složku s písněmi.")
+            return
+        if not self.diacritic_map:
+            QMessageBox.warning(self, "Varování", "Nejprve načtěte slovník diakritiky (libovolný *.csv).")
+            self.announce("Nejprve načtěte slovník diakritiky.")
+            return
+        candidates, unrepaired = library_model.find_diacritic_repairs(self.library, self.diacritic_map)
+        total = len(self.library)
+        c_count = len(candidates)
+        u_count = len(unrepaired)
+        if c_count == 0:
+            # i tak zobrazit výpis jako v telefonu settings_page.dart:381
+            self.announce(f"Žádné názvy k opravě nebyly nalezeny. V knihovně {total} písní.")
+        else:
+            self.announce(f"Nalezeno {c_count} návrhů na opravu z {total}. Bez návrhu {u_count}. Zkontrolujte seznam.")
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Kontrola změn ({total} písní)")
+        dlg.resize(780, 520)
+        layout = QVBoxLayout(dlg)
+
+        info_lab = QLabel(f"K opravě: {c_count}  •  Bez návrhu: {u_count}  •  Celkem: {total}  •  Slovník: {Path(self.diacritic_path).name if self.diacritic_path else ''} ({len(self.diacritic_map)} záznamů)")
+        info_lab.setWordWrap(True)
+        info_lab.setAccessibleName("Souhrn náhledu oprav")
+        layout.addWidget(info_lab)
+
+        # seznam kandidátů
+        if candidates:
+            lab = QLabel(f"K opravě ({c_count}):")
+            lab.setStyleSheet("font-weight: bold;")
+            layout.addWidget(lab)
+            cand_list = QListWidget()
+            cand_list.setAccessibleName("Seznam návrhů k opravě")
+            for c in candidates:
+                cand_list.addItem(f"{c['currentArtist']} – {c['currentTitle']}  →  {c['newArtist']} – {c['newTitle']}")
+            layout.addWidget(cand_list, 1)
+        if unrepaired:
+            lab2 = QLabel(f"Bez návrhu ({u_count}):")
+            lab2.setStyleSheet("font-weight: bold; color: #555;")
+            layout.addWidget(lab2)
+            unrep_list = QListWidget()
+            unrep_list.setAccessibleName("Seznam bez návrhu")
+            for u in unrepaired[:200]:
+                reason_map = {"alreadyCorrect": "už správně", "missingInMap": "chybí ve slovníku", "compositeNoMatch": "kompozit bez shody"}
+                reason = reason_map.get(u.get("reason"), u.get("reason"))
+                unrep_list.addItem(f"{u.get('artist')} – {u.get('title')}  [{reason}]")
+            if len(unrepaired) > 200:
+                unrep_list.addItem(f"… a dalších {len(unrepaired)-200}")
+            layout.addWidget(unrep_list, 1)
+            hint = QLabel(f"Celkem {total} písní v knihovně, k opravě {c_count}, bez návrhu {u_count}.")
+            hint.setStyleSheet("color: #666; font-size: 11px;")
+            layout.addWidget(hint)
+
+        chk = QCheckBox("Přejmenovat i soubory na disku")
+        chk.setAccessibleName("Přejmenovat i soubory na disku")
+        chk.setAccessibleDescription("Přejmenuje .txt soubory podle opraveného interpreta a názvu. Na Windows může selhat, pokud je soubor otevřen.")
+        try:
+            chk.setChecked(bool(self.settings.value("diacriticRenameFiles", True) if not isinstance(self.settings.value("diacriticRenameFiles", True), str) else self.settings.value("diacriticRenameFiles", True).lower() in ("true","1")))
+        except Exception:
+            chk.setChecked(True)
+        layout.addWidget(chk)
+
+        btn_row = QHBoxLayout()
+        export_btn = QPushButton("Exportovat náhled do CSV…")
+        export_btn.setAccessibleName("Exportovat náhled oprav do CSV")
+        def do_export():
+            out, _ = QFileDialog.getSaveFileName(dlg, "Uložit náhled oprav", f"nahled_oprav_{Path(self.diacritic_path).stem if self.diacritic_path else 'slovnik'}.csv", "CSV (*.csv)")
+            if not out:
+                return
+            ok2, res = library_model.export_diacritic_preview_csv(candidates, unrepaired, out)
+            if ok2:
+                QMessageBox.information(dlg, "Export", f"Náhled uložen do:\n{res}")
+                self.announce(f"Náhled exportován do {res}")
+                try:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(res)))
+                except Exception:
+                    pass
+            else:
+                QMessageBox.critical(dlg, "Chyba", res)
+        export_btn.clicked.connect(do_export)
+        btn_row.addWidget(export_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText(f"Potvrdit ({c_count})" if c_count else "Zavřít")
+        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("Zrušit")
+        if c_count == 0:
+            btns.button(QDialogButtonBox.StandardButton.Cancel).setVisible(False)
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            layout.addWidget(btns)
+            # umožnit i zavření přes Ok
+            btns.accepted.connect(lambda: None)
+        else:
+            btns.accepted.connect(dlg.accept)
+            btns.rejected.connect(dlg.reject)
+            layout.addWidget(btns)
+
+        # tts ohlásit otevření
+        tts.speak(info_lab.text())
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.announce("Oprava zrušena.")
+            return
+        if c_count == 0:
+            return
+        rename = chk.isChecked()
+        try:
+            self.settings.setValue("diacriticRenameFiles", bool(rename))
+        except Exception:
+            pass
+        # uložit staré cesty před přejmenováním
+        old_paths = {c.get("index"): c.get("filePath") for c in candidates}
+        res = library_model.apply_diacritic_repairs(self.library, candidates, rename_files=rename)
+        # aktualizovat filePath i artist/title v setlistu pokud došlo k rename
+        if rename and res.get("filesRenamed", 0) > 0:
+            for c in candidates:
+                idx = c.get("index")
+                old = old_paths.get(idx)
+                if not old:
+                    continue
+                new = self.library[idx].get("filePath") if idx is not None and 0 <= idx < len(self.library) else None
+                if new and new != old:
+                    for s in self.setlist:
+                        if s.get("filePath") == old:
+                            s["filePath"] = new
+                            s["artist"] = c.get("newArtist") or s.get("artist")
+                            s["title"] = c.get("newTitle") or s.get("title")
+                else:
+                    # i když rename selhalo, aktualizuj aspoň metadata
+                    for s in self.setlist:
+                        if s.get("filePath") == old:
+                            s["artist"] = c.get("newArtist") or s.get("artist")
+                            s["title"] = c.get("newTitle") or s.get("title")
+        else:
+            # bez rename – aktualizuj jen metadata podle filePath shody nebo title/artist
+            for c in candidates:
+                for s in self.setlist:
+                    if s.get("filePath") and s.get("filePath") == c.get("filePath"):
+                        s["artist"] = c.get("newArtist") or s.get("artist")
+                        s["title"] = c.get("newTitle") or s.get("title")
+        self.refresh_library_list()
+        self.refresh_setlist()
+        self._mark_dirty()
+        msg2 = f"Opraveno {res['dbUpdated']} názvů."
+        if rename:
+            if res['filesFailed'] > 0:
+                msg2 += f" Přejmenováno {res['filesRenamed']}, selhalo {res['filesFailed']} (soubor otevřen nebo chráněn)."
+            elif res['filesRenamed'] > 0:
+                msg2 += f" Přejmenováno {res['filesRenamed']} souborů."
+        QMessageBox.information(self, "Hotovo", msg2)
+        self.announce(msg2)
+        self.status_label.setText(msg2 + " | " + self.status_label.text())
+        if res['filesFailed'] > 0:
+            detail = "\n".join(res['failedPaths'][:3])
+            QMessageBox.warning(self, "Selhání přejmenování", f"Některé soubory se nepodařilo přejmenovat (otevřeny):\n{detail}")
 
     def choose_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Vyberte výstupní složku")

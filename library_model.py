@@ -8,6 +8,7 @@ import pathlib
 
 import playlist_backend
 import song_parser
+import diacritic as diacritic_mod
 
 
 def _read_text_file(path: str) -> str:
@@ -156,6 +157,98 @@ def save_entry_to_file(entry: dict) -> tuple[bool, str]:
             f.write(new_content)
         entry["content"] = new_content
         return True, fp
+    except Exception as e:
+        return False, str(e)
+
+
+# --- Diakritika helpers (port database.dart) ---
+
+def find_diacritic_repairs(entries: list[dict], dmap: dict) -> tuple[list[dict], list[dict]]:
+    """Deleguje na diacritic.find_diacritic_repairs."""
+    return diacritic_mod.find_diacritic_repairs(entries, dmap)
+
+
+def apply_diacritic_repairs(entries: list[dict], candidates: list[dict], rename_files: bool = True) -> dict:
+    """
+    Aplikuje kandidáty na entries a volitelně přejmenuje soubory.
+    candidates: z find_diacritic_repairs (obsahuje index, newArtist/newTitle)
+    Vrací {dbUpdated, filesRenamed, filesFailed, failedPaths}
+    """
+    db_updated = 0
+    renamed = 0
+    failed = 0
+    failed_paths: list[str] = []
+    # mapa index->candidate
+    cand_by_idx = {c["index"]: c for c in candidates}
+    for idx, cand in cand_by_idx.items():
+        if idx < 0 or idx >= len(entries):
+            continue
+        e = entries[idx]
+        new_a = cand.get("newArtist") or e.get("artist")
+        new_t = cand.get("newTitle") or e.get("title")
+        if new_a == e.get("artist") and new_t == e.get("title"):
+            continue
+        e["artist"] = new_a
+        e["title"] = new_t
+        db_updated += 1
+
+    if not rename_files:
+        return {"dbUpdated": db_updated, "filesRenamed": 0, "filesFailed": 0, "failedPaths": []}
+
+    for idx, cand in cand_by_idx.items():
+        if idx < 0 or idx >= len(entries):
+            continue
+        e = entries[idx]
+        old_path = cand.get("filePath") or e.get("filePath")
+        if not old_path or not os.path.exists(old_path):
+            continue
+        # pokud se název nezměnil, přeskočit (už ošetřeno)
+        if cand.get("newArtist") == cand.get("currentArtist") and cand.get("newTitle") == cand.get("currentTitle"):
+            continue
+        try:
+            dir_name = os.path.dirname(old_path)
+            safe_a = re.sub(r'[\\/:*?"<>|]', '_', e.get("artist") or "").strip()
+            safe_t = re.sub(r'[\\/:*?"<>|]', '_', e.get("title") or "").strip()
+            if not safe_t:
+                continue
+            new_name = f"{safe_a} - {safe_t}.txt" if safe_a else f"{safe_t}.txt"
+            new_path = os.path.join(dir_name, new_name)
+            # MAX_PATH ochrana ~240
+            if len(new_path) > 240:
+                ext = ".txt"
+                max_base = 240 - len(dir_name) - len(ext) - 1
+                if max_base > 10:
+                    new_name = new_name[:max_base] + ext
+                    new_path = os.path.join(dir_name, new_name)
+            cnt = 1
+            while new_path != old_path and os.path.exists(new_path):
+                base = new_name.replace(".txt", "")
+                new_path = os.path.join(dir_name, f"{base}_{cnt}.txt")
+                cnt += 1
+            if new_path == old_path:
+                continue
+            os.rename(old_path, new_path)
+            # odstranit starý bak pokud existuje? ponechat
+            e["filePath"] = new_path
+            renamed += 1
+        except Exception:
+            failed += 1
+            failed_paths.append(old_path)
+    return {"dbUpdated": db_updated, "filesRenamed": renamed, "filesFailed": failed, "failedPaths": failed_paths}
+
+
+def export_diacritic_preview_csv(candidates: list[dict], unrepaired: list[dict], out_path: str) -> tuple[bool, str]:
+    """Zapíše náhled oprav do CSV pro kontrolu. Vrací (ok, path/msg)."""
+    try:
+        import csv as _csv
+        with open(out_path, 'w', encoding='utf-8-sig', newline='') as f:
+            w = _csv.writer(f, delimiter=',', quotechar='"', quoting=_csv.QUOTE_MINIMAL)
+            w.writerow(["stav", "soubor", "puvodni_interpret", "puvodni_nazev", "novy_interpret", "novy_nazev", "duvod"])
+            for c in candidates:
+                w.writerow(["k_oprave", c.get("filePath") or "", c.get("currentArtist") or "", c.get("currentTitle") or "", c.get("newArtist") or "", c.get("newTitle") or "", ""])
+            for u in unrepaired:
+                w.writerow(["bez_navrhu", u.get("filePath") or "", u.get("artist") or "", u.get("title") or "", "", "", u.get("reason") or ""])
+        return True, out_path
     except Exception as e:
         return False, str(e)
 
