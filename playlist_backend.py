@@ -149,8 +149,9 @@ def _normalize_song_entry(entry):
         return {"title": t, "artist": a, "duration": None, "tempo": None}
 
 
-def build_playlist_data(name, songs):
-    """Sestaví v3 playlist dict (zpětně kompatibilní s v2). songs = list[dict|str] toleruje obojí."""
+def build_playlist_data(name, songs, tts_engine=None, tts_voice=None):
+    """Sestaví v3 playlist dict (zpětně kompatibilní s v2). songs = list[dict|str] toleruje obojí.
+       tts_engine/tts_voice se ukládá jako meta pro per-setlist preferenci hlasu (volitelné)."""
     if not name or not (isinstance(name, str) and name.strip()):
         return None
     if not songs:
@@ -195,7 +196,7 @@ def build_playlist_data(name, songs):
     if not clean:
         return None
     version = 3 if has_marks else 3  # vždy v3 pro PC editor (telefon umí v2 i v3)
-    return {
+    data = {
         "type": "playlist",
         "version": version,
         "name": name.strip(),
@@ -204,24 +205,30 @@ def build_playlist_data(name, songs):
         "unknownCount": unknown,
         "songs": clean,
     }
+    # per-setlist TTS preference (obojí: QSettings + JSON)
+    if tts_engine and str(tts_engine).strip().lower() in ("auto", "edge", "gtts"):
+        data["ttsEngine"] = str(tts_engine).strip().lower()
+        if tts_voice:
+            data["ttsVoice"] = str(tts_voice).strip()
+    return data
 
 
-def playlist_to_text(name, songs):
-    data = build_playlist_data(name, songs)
+def playlist_to_text(name, songs, tts_engine=None, tts_voice=None):
+    data = build_playlist_data(name, songs, tts_engine=tts_engine, tts_voice=tts_voice)
     if data is None:
         return None
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def save_playlist(name, songs):
+def save_playlist(name, songs, tts_engine=None, tts_voice=None):
     filename = f"{name.strip().replace(' ', '_')}.json"
-    return save_playlist_to(filename, name, songs)
+    return save_playlist_to(filename, name, songs, tts_engine=tts_engine, tts_voice=tts_voice)
 
 
-def save_playlist_to(filename, name, songs):
+def save_playlist_to(filename, name, songs, tts_engine=None, tts_voice=None):
     if not name or not str(name).strip() or not songs:
         return False, "Název ani seznam písní nesmí být prázdný."
-    data = build_playlist_data(name, songs)
+    data = build_playlist_data(name, songs, tts_engine=tts_engine, tts_voice=tts_voice)
     if data is None:
         return False, "Nepodařilo se sestavit playlist (prázdné položky)."
     try:

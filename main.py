@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QListWidget, QListWidgetItem, QMessageBox, QFileDialog, QDialog,
     QDialogButtonBox, QFormLayout, QSpinBox, QGroupBox, QSplitter, QTabWidget,
-    QTextEdit, QCheckBox
+    QTextEdit, QCheckBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QUrl, QStringListModel, QSettings
 from PyQt6.QtGui import QDesktopServices
@@ -144,14 +144,35 @@ class PCEditorApp(QMainWindow):
         self.live_label = QLabel("")
         self.live_label.setAccessibleName("")
         self.live_label.setProperty("accessibleLiveRegion", "polite")
-        # hlas
+        # hlas – migrace voiceConfirm -> voiceEnabled + nové klíče voiceEngine/edgeVoice
         self.settings = QSettings("Posouvac", "PCEditor")
-        voice_enabled = self.settings.value("voiceConfirm", True)
-        # QSettings vrací string na některých platformách
+        voice_enabled = self.settings.value("voiceEnabled", self.settings.value("voiceConfirm", True))
         if isinstance(voice_enabled, str):
             voice_enabled = voice_enabled.lower() in ("true", "1", "yes")
         tts.set_enabled(bool(voice_enabled))
+        # engine + edge voice (perzistence obojí: QSettings + JSON setlistu)
+        eng = self.settings.value("voiceEngine", "auto")
+        if isinstance(eng, str):
+            eng = eng.strip().lower()
+            if eng not in ("auto", "edge", "gtts"):
+                eng = "auto"
+        else:
+            eng = "auto"
+        tts.set_engine(eng)
+        ev = self.settings.value("edgeVoice", tts.get_edge_voice())
+        if isinstance(ev, str) and ev.strip():
+            tts.set_edge_voice(ev.strip())
+        # fallback hláška -> statusBar
+        try:
+            tts.set_fallback_callback(lambda msg: self.statusBar().showMessage(msg, 5000))
+        except Exception:
+            pass
         self.init_ui()
+        # audio bridge musí vzniknout v main threadu po QApplication
+        try:
+            tts.init_after_app()
+        except Exception:
+            pass
 
     def announce(self, msg):
         self.statusBar().showMessage(msg, 4000)
@@ -223,23 +244,83 @@ class PCEditorApp(QMainWindow):
         self.diacritic_status.setWordWrap(True)
         dia_row.addWidget(self.diacritic_status, 1)
 
+        # hlas: checkbox + engine combo + edge voice combo + test
         self.voice_check = QCheckBox("Hlasové potvrzení")
         self.voice_check.setAccessibleName("Hlasové potvrzení")
-        self.voice_check.setAccessibleDescription("Když zapnuto, aplikace hlásí akce přes čtečku obrazovky (NVDA/JAWS) nebo SAPI, pomocí accessible_output2 Auto().")
-        # sync s QSettings – reuse voice_enabled z __init__
+        self.voice_check.setAccessibleDescription("Když zapnuto, aplikace hlásí akce hlasem. Vypnutí ztlumí všechny enginy.")
         try:
-            ve = self.settings.value("voiceConfirm", True)
-            if isinstance(ve, str):
-                ve = ve.lower() in ("true", "1", "yes")
-            self.voice_check.setChecked(bool(ve))
+            ve2 = self.settings.value("voiceEnabled", self.settings.value("voiceConfirm", True))
+            if isinstance(ve2, str):
+                ve2 = ve2.lower() in ("true", "1", "yes")
+            self.voice_check.setChecked(bool(ve2))
         except Exception:
             self.voice_check.setChecked(True)
         self.voice_check.toggled.connect(self.on_voice_toggled)
         dia_row.addWidget(self.voice_check)
 
+        # Engine combo – auto/edge/gtts (detekce dostupnosti)
+        self.voice_engine_combo = QComboBox()
+        self.voice_engine_combo.setAccessibleName("Hlasový engine")
+        self.voice_engine_combo.setAccessibleDescription("Vyberte hlas. Auto je offline přes čtečku, Edge a gTTS vyžadují internet a jsou kvalitnější.")
+        try:
+            avail = tts.get_available_engines()
+        except Exception:
+            avail = [("auto", "Čtečka obrazovky (offline)", True, "")]
+        for eid, label, ok, reason in avail:
+            self.voice_engine_combo.addItem(label, eid)
+            idx = self.voice_engine_combo.count() - 1
+            # disable unavailable – model item
+            try:
+                from PyQt6.QtCore import Qt as _Qt
+                item = self.voice_engine_combo.model().item(idx)
+                if not ok:
+                    item.setEnabled(False)
+                    item.setToolTip(reason)
+                else:
+                    if eid in ("edge", "gtts"):
+                        item.setToolTip("Vyžaduje internet")
+            except Exception:
+                pass
+        # nastavit aktuální engine
+        try:
+            cur_eng = tts.get_engine()
+            for i in range(self.voice_engine_combo.count()):
+                if self.voice_engine_combo.itemData(i) == cur_eng:
+                    self.voice_engine_combo.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+        self.voice_engine_combo.currentIndexChanged.connect(self.on_voice_engine_changed)
+        dia_row.addWidget(QLabel("Hlas:"))
+        dia_row.addWidget(self.voice_engine_combo)
+
+        # Edge voice combo – viditelné jen pro edge
+        self.edge_voice_combo = QComboBox()
+        self.edge_voice_combo.setAccessibleName("Hlas Edge TTS")
+        self.edge_voice_combo.setAccessibleDescription("Výběr českého hlasu pro Edge TTS. Vlasta žena, Antonín muž.")
+        try:
+            from tts import EDGE_VOICES_CS
+            voices = EDGE_VOICES_CS
+        except Exception:
+            voices = [("cs-CZ-VlastaNeural", "Vlasta (žena)"), ("cs-CZ-AntoninNeural", "Antonín (muž)")]
+        for vid, vlabel in voices:
+            self.edge_voice_combo.addItem(vlabel, vid)
+        try:
+            cur_v = tts.get_edge_voice()
+            for i in range(self.edge_voice_combo.count()):
+                if self.edge_voice_combo.itemData(i) == cur_v:
+                    self.edge_voice_combo.setCurrentIndex(i)
+                    break
+        except Exception:
+            pass
+        self.edge_voice_combo.currentIndexChanged.connect(self.on_edge_voice_changed)
+        dia_row.addWidget(self.edge_voice_combo)
+        self._update_edge_voice_visibility()
+
         self.voice_test_btn = QPushButton("Zkouška hlasu")
         self.voice_test_btn.setAccessibleName("Zkouška hlasového výstupu")
-        self.voice_test_btn.clicked.connect(lambda: tts.speak("Zkouška hlasového výstupu. Slovník obsahuje {} záznamů.".format(len(self.diacritic_map)) if self.diacritic_map else "Zkouška hlasového výstupu."))
+        self.voice_test_btn.setToolTip("Přehraje zkušební hlášku aktuálním enginem (Edge/gTTS vyžaduje internet, při selhání fallback na Auto).")
+        self.voice_test_btn.clicked.connect(self.on_voice_test)
         dia_row.addWidget(self.voice_test_btn)
 
         dia_row.addStretch()
@@ -533,6 +614,17 @@ class PCEditorApp(QMainWindow):
             self.setlist = enriched
             self.setlist_name_input.setText(data.get("name") or Path(fn).stem)
         
+        # per-setlist TTS meta: nabídnout přepnutí hlasu dle importovaného souboru
+        try:
+            imp_eng = str(data.get("ttsEngine") or "").strip().lower()
+            imp_voice = str(data.get("ttsVoice") or "").strip()
+            if imp_eng in ("auto", "edge", "gtts"):
+                cur_eng = tts.get_engine()
+                if imp_eng != cur_eng:
+                    # nechat uživatele rozhodnout, ale nerušit import
+                    self.statusBar().showMessage(f"Setlist preferuje hlas {imp_eng}" + (f" ({imp_voice})" if imp_voice else "") + " – přepnout v Hlas menu.", 6000)
+        except Exception:
+            pass
         self.refresh_setlist()
         self.announce(f"Importováno {len(enriched)} písní z {data.get('name')}. Chybějících v knihovně: {len(missing)}.")
         if missing:
@@ -558,10 +650,94 @@ class PCEditorApp(QMainWindow):
     def on_voice_toggled(self, checked: bool):
         tts.set_enabled(bool(checked))
         try:
+            self.settings.setValue("voiceEnabled", bool(checked))
             self.settings.setValue("voiceConfirm", bool(checked))
         except Exception:
             pass
         self.announce("Hlasové potvrzení zapnuto." if checked else "Hlasové potvrzení vypnuto.")
+
+    def on_voice_engine_changed(self, idx: int):
+        try:
+            eid = self.voice_engine_combo.itemData(idx)
+            if not eid:
+                return
+            eid = str(eid)
+            # zkontrolovat dostupnost
+            if not tts.is_available(eid):
+                for _i, _label, _ok, _reason in tts.get_available_engines():
+                    if _i == eid and not _ok:
+                        QMessageBox.warning(self, "Hlas není dostupný", _reason or "Engine není dostupný.")
+                        # vrátit na auto
+                        for j in range(self.voice_engine_combo.count()):
+                            if self.voice_engine_combo.itemData(j) == "auto":
+                                self.voice_engine_combo.blockSignals(True)
+                                self.voice_engine_combo.setCurrentIndex(j)
+                                self.voice_engine_combo.blockSignals(False)
+                                break
+                        return
+            tts.set_engine(eid)
+            try:
+                self.settings.setValue("voiceEngine", eid)
+            except Exception:
+                pass
+            self._update_edge_voice_visibility()
+            # hláška s interrupt, ať je slyšet změna hned
+            name_map = {"auto": "čtečka obrazovky (offline)", "edge": "Edge TTS (online)", "gtts": "Google gTTS (online)"}
+            self.announce(f"Hlas přepnut na {name_map.get(eid, eid)}.")
+            if eid in ("edge", "gtts"):
+                self.statusBar().showMessage("Online hlas vyžaduje internet – při selhání se použije offline.", 5000)
+        except Exception as e:
+            QMessageBox.warning(self, "Chyba", str(e))
+
+    def on_edge_voice_changed(self, idx: int):
+        try:
+            vid = self.edge_voice_combo.itemData(idx)
+            if not vid:
+                return
+            tts.set_edge_voice(str(vid))
+            try:
+                self.settings.setValue("edgeVoice", str(vid))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _update_edge_voice_visibility(self):
+        try:
+            cur = self.voice_engine_combo.currentData()
+            is_edge = (str(cur) == "edge")
+            self.edge_voice_combo.setVisible(is_edge)
+            # label accessibility
+            self.edge_voice_combo.setEnabled(is_edge)
+        except Exception:
+            pass
+
+    def on_voice_test(self):
+        # zkouška hlasu – zkouší aktuální engine, při selhání fallback hlásí tts + zobrazíme info
+        txt = "Zkouška hlasového výstupu. Slovník obsahuje {} záznamů.".format(len(self.diacritic_map)) if self.diacritic_map else "Zkouška hlasového výstupu."
+        # detail o enginu pro přístupnost
+        try:
+            eng = tts.get_engine()
+            if eng == "edge":
+                txt = f"Zkouška hlasu Edge, hlas {tts.get_edge_voice()}. " + txt
+            elif eng == "gtts":
+                txt = "Zkouška hlasu Google. " + txt
+        except Exception:
+            pass
+        try:
+            tts.speak(txt, interrupt=True)
+        except Exception:
+            pass
+        # pokud je online engine nedostupný, upozorni
+        try:
+            eng = tts.get_engine()
+            if eng in ("edge", "gtts") and not tts.is_available(eng):
+                for eid, _, ok, reason in tts.get_available_engines():
+                    if eid == eng and not ok:
+                        QMessageBox.warning(self, "Hlas nedostupný", reason)
+                        break
+        except Exception:
+            pass
 
     def load_diacritic_csv(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Načíst slovník diakritiky", "", "CSV (*.csv);;Vše (*)")
@@ -1011,7 +1187,14 @@ class PCEditorApp(QMainWindow):
             if not include_texts:
                 e.pop("content", None)
             export_songs.append(e)
-        success, result = playlist_backend.save_playlist_to(json_path, name, export_songs)
+        # per-setlist TTS meta (obojí: QSettings + JSON)
+        try:
+            _tts_eng = tts.get_engine()
+            _tts_voice = tts.get_edge_voice() if _tts_eng == "edge" else None
+        except Exception:
+            _tts_eng = None
+            _tts_voice = None
+        success, result = playlist_backend.save_playlist_to(json_path, name, export_songs, tts_engine=_tts_eng, tts_voice=_tts_voice)
         if not success:
             QMessageBox.critical(self, "Chyba", f"JSON se nepodařilo uložit: {result}")
             return
@@ -1046,7 +1229,13 @@ class PCEditorApp(QMainWindow):
                 e.pop("content", None)
             export_songs.append(e)
         json_path = os.path.join(folder, f"{name.replace(' ', '_')}.json")
-        success, result = playlist_backend.save_playlist_to(json_path, name, export_songs)
+        try:
+            _tts_eng = tts.get_engine()
+            _tts_voice = tts.get_edge_voice() if _tts_eng == "edge" else None
+        except Exception:
+            _tts_eng = None
+            _tts_voice = None
+        success, result = playlist_backend.save_playlist_to(json_path, name, export_songs, tts_engine=_tts_eng, tts_voice=_tts_voice)
         if success:
             QMessageBox.information(self, "Uloženo", f"Setlist uložen do:\n{result}\n\nZkopírujte přes USB.")
             self.announce(f"Setlist uložen: {result}")
@@ -1088,7 +1277,13 @@ class PCEditorApp(QMainWindow):
         if not self._require_setlist():
             return
         name = self.setlist_name_input.text().strip()
-        text = playlist_backend.playlist_to_text(name, self.setlist)
+        try:
+            _tts_eng = tts.get_engine()
+            _tts_voice = tts.get_edge_voice() if _tts_eng == "edge" else None
+        except Exception:
+            _tts_eng = None
+            _tts_voice = None
+        text = playlist_backend.playlist_to_text(name, self.setlist, tts_engine=_tts_eng, tts_voice=_tts_voice)
         if not text:
             QMessageBox.critical(self, "Chyba", "Nepodařilo se sestavit JSON.")
             return
