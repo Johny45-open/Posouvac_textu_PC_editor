@@ -424,6 +424,22 @@ def save_playlist_docx(filename, name, songs, include_details=True, include_text
         return False, str(e)
 
 
+def save_library_docx(filename, title, songs, include_duration=True, include_tempo=True, include_stops=True):
+    """Wrapper nad word_export.save_library_docx."""
+    try:
+        import word_export
+        return word_export.save_library_docx(
+            filename, title, songs,
+            include_duration=include_duration,
+            include_tempo=include_tempo,
+            include_stops=include_stops,
+        )
+    except ImportError as e:
+        return False, f"Chybí python-docx ({e}). Nainstalujte: pip install python-docx"
+    except Exception as e:
+        return False, str(e)
+
+
 def get_qr_payload(name, songs):
     """Vrátí JSON string pro QR (bez content/filePath) + délku. Pro QR se používá stejné v3."""
     data = build_playlist_data(name, songs)

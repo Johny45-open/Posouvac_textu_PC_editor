@@ -529,6 +529,272 @@ def build_word_document(name, songs, include_details=True, include_texts=False, 
     return doc, None
 
 
+def build_library_word_document(title, songs, include_duration=True, include_tempo=True, include_stops=True):
+    """
+    Sestaví tisknutelný .docx se seznamem knihovny (abecedně).
+    songs = list[dict] {title,artist,duration,tempo,stopMarks}
+    Vrací (Document, None) nebo (None, err).
+    """
+    ok, err = _check_docx()
+    if not ok:
+        return None, err
+    if not title or not str(title).strip():
+        return None, "Název seznamu nesmí být prázdný."
+    if not songs:
+        return None, "Seznam neobsahuje žádné písně."
+
+    # normalizace + abecední řazení
+    try:
+        import playlist_backend as pb
+        norm = []
+        for s in songs:
+            n = pb._normalize_song_entry(s)
+            if n and n.get("title"):
+                if s.get("stopMarks") and not n.get("stopMarks"):
+                    n["stopMarks"] = s.get("stopMarks")
+                norm.append(n)
+            elif s.get("title"):
+                norm.append(s)
+    except Exception:
+        norm = [s for s in songs if s.get("title")]
+    # abecedně dle interpretu + názvu (case-insensitive)
+    try:
+        norm.sort(key=lambda s: (((s.get("artist") or "").strip().lower(), (s.get("title") or "").strip().lower())))
+    except Exception:
+        pass
+
+    total = sum(int(s["duration"]) for s in norm if s.get("duration") and int(s["duration"]) > 0)
+    unknown = sum(1 for s in norm if not s.get("duration") or int(s.get("duration") or 0) <= 0)
+
+    doc = Document()
+    _style_document(doc)
+    _setup_section(doc, title.strip())
+
+    # --- Titul ---
+    h = doc.add_heading(title.strip(), level=1)
+    h.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    try:
+        for run in h.runs:
+            run.font.color.rgb = RGBColor(0x1A, 0x1A, 0x1A)
+    except Exception:
+        pass
+
+    # meta
+    meta = doc.add_paragraph()
+    meta.paragraph_format.space_after = Pt(2)
+    now_str = datetime.now().strftime("%d. %m. %Y %H:%M")
+    total_min = total // 60
+    total_sec = total % 60
+    if unknown == 0:
+        time_label = f"Celkový čas: {total_min}:{total_sec:02d} • {len(norm)} písní"
+    else:
+        time_label = f"Celkový čas: {total_min}:{total_sec:02d} + {unknown} bez času (odhad +{unknown*3} min) • {len(norm)} písní"
+    r = meta.add_run(f"{time_label}  •  Export: {now_str}")
+    r.font.size = Pt(9)
+    r.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+
+    if unknown > 0:
+        hint = doc.add_paragraph()
+        hint.paragraph_format.space_after = Pt(8)
+        hr = hint.add_run("„?“ = délka neznámá, do součtu se nepočítá (odhad 3 min/píseň).")
+        hr.font.size = Pt(8)
+        hr.font.italic = True
+        hr.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+
+    # --- Tabulka ---
+    # dynamické sloupce
+    headers = ["#", "Interpret", "Název"]
+    col_keys = ["num", "artist", "title"]
+    if include_duration:
+        headers.append("Délka")
+        col_keys.append("duration")
+    if include_tempo:
+        headers.append("Tempo")
+        col_keys.append("tempo")
+    if include_stops:
+        headers.append("Zarážky")
+        col_keys.append("stops")
+    cols = len(headers)
+    table = doc.add_table(rows=1, cols=cols)
+    table.style = 'Light Grid Accent 1'
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = True
+    try:
+        table.allow_autofit = True
+    except Exception:
+        pass
+
+    hdr_cells = table.rows[0].cells
+    # indexy centrovaných sloupců (číslo + volitelné)
+    center_cols = {0}
+    if include_duration:
+        center_cols.add(headers.index("Délka"))
+    if include_tempo:
+        center_cols.add(headers.index("Tempo"))
+    if include_stops:
+        center_cols.add(headers.index("Zarážky"))
+    for i, txt in enumerate(headers):
+        cell = hdr_cells[i]
+        cell.text = ""
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER if i in center_cols else WD_ALIGN_PARAGRAPH.LEFT
+        run = p.add_run(txt)
+        run.bold = True
+        run.font.size = Pt(9)
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        _set_cell_shading(cell, "2E74B5")
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        _set_cell_margins(cell, top=60, bottom=60)
+    _set_repeat_header(table.rows[0])
+
+    # šířky – rozdělit podle počtu sloupců
+    base_widths = {
+        "#": Cm(0.9), "Interpret": Cm(4.8), "Název": Cm(5.8),
+        "Délka": Cm(1.5), "Tempo": Cm(1.8), "Zarážky": Cm(2.0),
+    }
+    widths = [base_widths.get(h, Cm(2.0)) for h in headers]
+    for row in table.rows:
+        for idx, w in enumerate(widths):
+            try:
+                row.cells[idx].width = w
+            except Exception:
+                pass
+
+    for i, s in enumerate(norm):
+        row = table.add_row().cells
+        for col_idx, key in enumerate(col_keys):
+            c = row[col_idx]
+            c.text = ""
+            p = c.paragraphs[0]
+            is_center = col_idx in center_cols
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER if is_center else WD_ALIGN_PARAGRAPH.LEFT
+            if key == "num":
+                r = p.add_run(str(i + 1))
+                r.font.size = Pt(9)
+            elif key == "artist":
+                txt = s.get("artist") or "—"
+                r = p.add_run(txt)
+                r.font.size = Pt(9)
+                if not s.get("artist"):
+                    r.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+                    r.font.italic = True
+            elif key == "title":
+                r = p.add_run(s.get("title") or "")
+                r.font.size = Pt(9)
+                r.bold = True
+            elif key == "duration":
+                dur_txt = _format_duration_text(s.get("duration"))
+                r = p.add_run(dur_txt)
+                r.font.size = Pt(9)
+                if dur_txt == "?":
+                    r.font.color.rgb = RGBColor(0xC6, 0x28, 0x28)
+                    r.bold = True
+            elif key == "tempo":
+                tempo_txt = _format_tempo_text(s.get("tempo"))
+                r = p.add_run(tempo_txt)
+                r.font.size = Pt(9)
+                if tempo_txt == "—":
+                    r.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+            elif key == "stops":
+                marks = s.get("stopMarks") or []
+                txt = _stop_summary(marks) if marks else "—"
+                r = p.add_run(txt)
+                r.font.size = Pt(9)
+                if not marks:
+                    r.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+                else:
+                    r.bold = True
+            c.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            _set_cell_margins(c, top=40, bottom=40)
+        if i % 2 == 1:
+            for cell in row:
+                _set_cell_shading(cell, "F2F2F2")
+
+    # součtový řádek
+    if norm:
+        try:
+            sum_row = table.add_row().cells
+            # merge prvních 3 buněk (číslo+interpret+název) -> "Celkem:"
+            first = sum_row[0]
+            last_merge = sum_row[2] if cols >= 3 else sum_row[0]
+            if cols >= 3:
+                first.merge(last_merge)
+            p = first.paragraphs[0]
+            p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            rr = p.add_run("Celkem:")
+            rr.bold = True
+            rr.font.size = Pt(9)
+            _set_cell_shading(first, "D9E1F2")
+            # obarvit zbytek sum_row
+            for idx in range(1, len(sum_row)):
+                try:
+                    _set_cell_shading(sum_row[idx], "D9E1F2")
+                    sum_row[idx].vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                except Exception:
+                    pass
+            # hodnoty – mapovat dle col_keys
+            for col_idx, key in enumerate(col_keys):
+                if key in ("num", "artist", "title"):
+                    continue
+                cell = sum_row[col_idx] if col_idx < len(sum_row) else None
+                if cell is None:
+                    continue
+                p = cell.paragraphs[0]
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                if key == "duration":
+                    txt = f"{total_min}:{total_sec:02d}" + (f" +{unknown}?" if unknown else "")
+                elif key == "tempo":
+                    txt = f"{len(norm)} písní"
+                elif key == "stops":
+                    tot_marks = sum(len(s.get("stopMarks") or []) for s in norm)
+                    txt = f"{tot_marks} zarážek" if tot_marks else "—"
+                else:
+                    txt = ""
+                if txt:
+                    rr = p.add_run(txt)
+                    rr.bold = True
+                    rr.font.size = Pt(8 if key != "duration" else 9)
+                    if key == "tempo":
+                        rr.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
+        except Exception:
+            pass
+
+    # patička
+    doc.add_paragraph()
+    note = doc.add_paragraph()
+    note.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    note.paragraph_format.space_before = Pt(12)
+    nr = note.add_run(f"Vygenerováno Posouvač textu – PC Editor  •  {now_str}  •  {len(norm)} písní")
+    nr.font.size = Pt(7)
+    nr.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+    nr.font.italic = True
+
+    return doc, None
+
+
+def save_library_docx(filename, title, songs, include_duration=True, include_tempo=True, include_stops=True):
+    """Uloží seznam knihovny do .docx. Vrací (True, path) nebo (False, err)."""
+    ok, err = _check_docx()
+    if not ok:
+        return False, err
+    if not title or not str(title).strip():
+        return False, "Název seznamu nesmí být prázdný."
+    if not songs:
+        return False, "Seznam neobsahuje žádné písně."
+    doc, err2 = build_library_word_document(title, songs,
+                                            include_duration=include_duration,
+                                            include_tempo=include_tempo,
+                                            include_stops=include_stops)
+    if doc is None:
+        return False, err2 or "Nepodařilo se sestavit dokument."
+    try:
+        Path(filename).parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(filename))
+        return True, str(filename)
+    except Exception as e:
+        return False, str(e)
+
+
 def save_playlist_docx(filename, name, songs, include_details=True, include_texts=False, highlight_stops=True):
     """Uloží .docx do filename. Vrací (True, path) nebo (False, err)."""
     ok, err = _check_docx()

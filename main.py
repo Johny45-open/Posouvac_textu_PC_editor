@@ -132,6 +132,237 @@ class QRDialog(QDialog):
         layout.addWidget(btns)
 
 
+class LibraryWordExportDialog(QDialog):
+    """Dialog pro tisk seznamu knihovny do Wordu – výběr písní + volitelné sloupce."""
+    def __init__(self, library: list[dict], settings: QSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Tisk seznamu knihovny – export do Wordu")
+        self.setMinimumSize(720, 620)
+        self.settings = settings
+        self.library = list(library or [])
+
+        layout = QVBoxLayout(self)
+
+        # Název
+        title_row = QHBoxLayout()
+        title_lab = QLabel("Název seznamu:")
+        self.title_input = QLineEdit()
+        self.title_input.setAccessibleName("Název seznamu knihovny")
+        self.title_input.setAccessibleDescription("Nadpis v záhlaví dokumentu. Tiskne se i v záhlaví každé strany.")
+        try:
+            saved_title = str(settings.value("library/print/title", "") or "").strip()
+        except Exception:
+            saved_title = ""
+        if saved_title:
+            self.title_input.setText(saved_title)
+        else:
+            from datetime import datetime as _dt
+            self.title_input.setText(f"Seznam knihovny – {_dt.now().strftime('%d. %m. %Y')}")
+        title_lab.setBuddy(self.title_input)
+        title_row.addWidget(title_lab)
+        title_row.addWidget(self.title_input, 1)
+        layout.addLayout(title_row)
+
+        info = QLabel("Zaškrtněte písně k tisku. Filtr hledá v interpretu i názvu. Volitelné sloupce se uloží pro příště.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #555; font-size: 11px;")
+        layout.addWidget(info)
+
+        # Filtr
+        filt_row = QHBoxLayout()
+        filt_lab = QLabel("Hledat:")
+        self.filter_input = QLineEdit()
+        self.filter_input.setAccessibleName("Hledat v seznamu k tisku")
+        self.filter_input.setAccessibleDescription("Filtruje podle interpreta nebo názvu. Ovlivňuje i Vybrat vše.")
+        self.filter_input.setPlaceholderText("Filtr: interpret nebo název")
+        filt_lab.setBuddy(self.filter_input)
+        filt_row.addWidget(filt_lab)
+        filt_row.addWidget(self.filter_input, 1)
+        layout.addLayout(filt_row)
+
+        # Checklist
+        self.count_label = QLabel("")
+        self.count_label.setAccessibleName("Počet vybraných písní")
+        layout.addWidget(self.count_label)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setAccessibleName("Seznam písní k tisku – zaškrtněte")
+        self.list_widget.setAccessibleDescription("Mezerník přepne zaškrtnutí, Ctrl+A vybere vše filtrované. Abecedně řazeno.")
+        self.list_widget.setAlternatingRowColors(True)
+        layout.addWidget(self.list_widget, 1)
+
+        # Tlačítka výběru
+        sel_row = QHBoxLayout()
+        self.btn_all = QPushButton("Vybrat vše")
+        self.btn_all.setAccessibleName("Vybrat všechny filtrované")
+        self.btn_all.setToolTip("Zaškrtne jen filtrované. Pro vše vymažte filtr.")
+        self.btn_all.clicked.connect(self._select_all)
+        sel_row.addWidget(self.btn_all)
+        self.btn_none = QPushButton("Zrušit výběr")
+        self.btn_none.setAccessibleName("Zrušit výběr všech filtrovaných")
+        self.btn_none.setToolTip("Odškrtne jen filtrované – skryté zůstanou beze změny. Celkem viz počítadlo.")
+        self.btn_none.clicked.connect(self._select_none)
+        sel_row.addWidget(self.btn_none)
+        self.btn_inv = QPushButton("Invertovat")
+        self.btn_inv.setAccessibleName("Invertovat výběr filtrovaných")
+        self.btn_inv.setToolTip("Invertuje jen filtrované.")
+        self.btn_inv.clicked.connect(self._invert)
+        sel_row.addWidget(self.btn_inv)
+        sel_row.addStretch()
+        layout.addLayout(sel_row)
+
+        # Volitelné sloupce
+        col_row = QHBoxLayout()
+        col_row.addWidget(QLabel("Sloupce:"))
+        def _bool_val(key, default):
+            v = settings.value(key, default)
+            if isinstance(v, str):
+                return v.lower() in ("true", "1", "yes")
+            if isinstance(v, bool):
+                return v
+            return bool(v) if v is not None else default
+        self.col_duration = QCheckBox("Délka")
+        self.col_duration.setAccessibleName("Sloupec Délka")
+        self.col_duration.setChecked(_bool_val("library/print/includeDuration", True))
+        col_row.addWidget(self.col_duration)
+        self.col_tempo = QCheckBox("Tempo")
+        self.col_tempo.setAccessibleName("Sloupec Tempo")
+        self.col_tempo.setChecked(_bool_val("library/print/includeTempo", True))
+        col_row.addWidget(self.col_tempo)
+        self.col_stops = QCheckBox("Zarážky")
+        self.col_stops.setAccessibleName("Sloupec Zarážky")
+        self.col_stops.setChecked(_bool_val("library/print/includeStops", True))
+        col_row.addWidget(self.col_stops)
+        col_row.addStretch()
+        layout.addLayout(col_row)
+
+        hint = QLabel("Tisk: A4 na výšku, okraje 2 cm, záhlaví = název, zápatí = číslování stran, hlavička tabulky se opakuje. Abecedně řazeno.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Uložit Word…")
+        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("Zavřít")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        # naplnit – abecedně
+        self._all_items: list[tuple[dict, str]] = []  # (entry, label_lower)
+        for e in sorted(self.library, key=lambda x: (((x.get("artist") or "").lower(), (x.get("title") or "").lower()))):
+            self._all_items.append((e, f"{e.get('artist') or ''} – {e.get('title') or ''}".lower()))
+
+        def _key(entry: dict) -> tuple:
+            fp = (entry.get("filePath") or "").strip()
+            if fp:
+                return ("path", fp.lower())
+            return ("name", (entry.get("artist") or "").strip().lower(), (entry.get("title") or "").strip().lower())
+        self._key = _key  # pro použití v metodách
+        # stav zaškrtnutí dle stabilního klíče – výchozí vše zaškrtnuto
+        self._checked: dict[tuple, bool] = {_key(entry): True for entry, _ in self._all_items}
+        self._refreshing = False
+        self.filter_input.textChanged.connect(self._refresh_list)
+        self.list_widget.itemChanged.connect(self._on_item_changed)
+        self._refresh_list()
+        self.filter_input.setFocus()
+
+    def _on_item_changed(self, item: QListWidgetItem):
+        if self._refreshing:
+            return
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(entry, dict):
+            self._checked[self._key(entry)] = (item.checkState() == Qt.CheckState.Checked)
+        self._update_count()
+
+    def _refresh_list(self):
+        filt = self.filter_input.text().strip().lower()
+        self._refreshing = True
+        self.list_widget.clear()
+        for entry, label_lower in self._all_items:
+            if filt and filt not in label_lower:
+                continue
+            dur = playlist_backend.format_duration(entry.get('duration'))
+            tempo = f"{int(entry['tempo'])} BPM" if entry.get('tempo') else "—"
+            marks = len(entry.get('stopMarks') or [])
+            marks_txt = f", {marks} zarážek" if marks else ""
+            label = f"{entry.get('artist') or '—'} – {entry.get('title') or ''}  [{dur}, {tempo}{marks_txt}]"
+            item = QListWidgetItem(label)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            is_checked = self._checked.get(self._key(entry), True)
+            item.setCheckState(Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            self.list_widget.addItem(item)
+        self._refreshing = False
+        self._update_count()
+
+    def _update_count(self):
+        total = len(self._all_items)
+        checked_total = sum(1 for v in self._checked.values() if v)
+        visible = self.list_widget.count()
+        checked_visible = 0
+        for i in range(visible):
+            if self.list_widget.item(i).checkState() == Qt.CheckState.Checked:
+                checked_visible += 1
+        filt = self.filter_input.text().strip()
+        if not filt:
+            self.count_label.setText(f"Vybráno {checked_total} / {total} písní")
+        else:
+            self.count_label.setText(f"Vybráno {checked_visible} / {visible} filtrovaných (celkem {checked_total}/{total})")
+
+    def _select_all(self):
+        for i in range(self.list_widget.count()):
+            it = self.list_widget.item(i)
+            entry = it.data(Qt.ItemDataRole.UserRole)
+            if isinstance(entry, dict):
+                self._checked[self._key(entry)] = True
+            it.setCheckState(Qt.CheckState.Checked)
+        self._update_count()
+
+    def _select_none(self):
+        for i in range(self.list_widget.count()):
+            it = self.list_widget.item(i)
+            entry = it.data(Qt.ItemDataRole.UserRole)
+            if isinstance(entry, dict):
+                self._checked[self._key(entry)] = False
+            it.setCheckState(Qt.CheckState.Unchecked)
+        self._update_count()
+
+    def _invert(self):
+        for i in range(self.list_widget.count()):
+            it = self.list_widget.item(i)
+            entry = it.data(Qt.ItemDataRole.UserRole)
+            new_state = Qt.CheckState.Unchecked if it.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked
+            if isinstance(entry, dict):
+                self._checked[self._key(entry)] = (new_state == Qt.CheckState.Checked)
+            it.setCheckState(new_state)
+        self._update_count()
+
+    def get_selected_songs(self) -> list[dict]:
+        out = []
+        for entry, _ in self._all_items:
+            if self._checked.get(self._key(entry), True):
+                out.append(entry)
+        return out
+
+    def get_options(self):
+        return {
+            "include_duration": self.col_duration.isChecked(),
+            "include_tempo": self.col_tempo.isChecked(),
+            "include_stops": self.col_stops.isChecked(),
+            "title": self.title_input.text().strip(),
+        }
+
+    def save_to_settings(self, opts):
+        try:
+            self.settings.setValue("library/print/title", opts.get("title") or "")
+            self.settings.setValue("library/print/includeDuration", bool(opts.get("include_duration")))
+            self.settings.setValue("library/print/includeTempo", bool(opts.get("include_tempo")))
+            self.settings.setValue("library/print/includeStops", bool(opts.get("include_stops")))
+        except Exception:
+            pass
+
+
 class WordExportDialog(QDialog):
     """Dialog pro přizpůsobení exportu do Wordu – ukládá volby do QSettings."""
     def __init__(self, settings: QSettings, parent=None):
@@ -455,6 +686,18 @@ class PCEditorApp(QMainWindow):
         self.lib_count_label.setAccessibleName("Počet písní v knihovně")
         left_layout.addWidget(self.lib_count_label)
 
+        # Tisk seznamu knihovny -> Word
+        lib_btn_row = QHBoxLayout()
+        self.library_print_btn = QPushButton("Tisk seznamu… (&T)")
+        self.library_print_btn.setAccessibleName("Tisk seznamu knihovny do Wordu")
+        self.library_print_btn.setAccessibleDescription("Otevře dialog s výběrem písní, uloží tisknutelný A4 .docx, vytisknete ve Wordu Ctrl+P. Zkratka Ctrl+P. Nápověda F1.")
+        self.library_print_btn.setToolTip("Tisk seznamu – zkratka Ctrl+P. Nápověda F1. T = Tisk. Export do Wordu s výběrem písní, tisk ve Wordu Ctrl+P.")
+        self.library_print_btn.clicked.connect(self.export_library_word)
+        self.library_print_btn.setEnabled(False)
+        lib_btn_row.addWidget(self.library_print_btn)
+        lib_btn_row.addStretch()
+        left_layout.addLayout(lib_btn_row)
+
         splitter.addWidget(left_widget)
 
         # Pravý: TabWidget Detail + Setlist
@@ -755,6 +998,10 @@ class PCEditorApp(QMainWindow):
             a.setShortcut(QKeySequence("Ctrl+F"))
             a.setStatusTip("Fokus filtr – Ctrl+F / F6 – F2 knihovna")
             a.triggered.connect(lambda: (self.tabs.setCurrentIndex(0) if hasattr(self, 'tabs') else None, self.filter_input.setFocus(), self.filter_input.selectAll()))
+            a = m_lib.addAction("Tisk seznamu knihovny do Wordu…")
+            a.setShortcut(QKeySequence("Ctrl+P"))
+            a.setStatusTip("Tisk knihovny – Ctrl+P / Alt+T – vyber písně, uloží A4 .docx, vytiskneš ve Wordu Ctrl+P")
+            a.triggered.connect(self.export_library_word)
 
             # Zobrazit – F2/F3/F4
             m_view = mb.addMenu("Zo&brazit")
@@ -798,6 +1045,11 @@ class PCEditorApp(QMainWindow):
 
             # Export
             m_ex = mb.addMenu("&Export")
+            a = m_ex.addAction("Tisk seznamu knihovny Word…")
+            a.setShortcut(QKeySequence("Ctrl+P"))
+            a.setStatusTip("Tisk knihovny – Ctrl+P – vyber písně, uloží A4 .docx")
+            a.triggered.connect(self.export_library_word)
+            m_ex.addSeparator()
             a = m_ex.addAction("Uložit setlist &JSON…")
             a.setShortcut(QKeySequence("Ctrl+J"))
             a.setStatusTip("JSON – Ctrl+J / Alt+J")
@@ -925,6 +1177,7 @@ class PCEditorApp(QMainWindow):
         _add("Alt+Up", lambda: self.move_setlist(-1))
         _add("Alt+Down", lambda: self.move_setlist(1))
         # Exporty s aliasy (bez kolizí: Ctrl+Q je Ukončit, QR je Ctrl+Shift+Q; CSV je Ctrl+Shift+C, schránka Ctrl+Alt+C)
+        _add("Ctrl+P", self.export_library_word)
         _add("Ctrl+J", self.save_playlist_json)
         _add("Ctrl+Shift+S", self.save_all)
         _add("Ctrl+H", self.export_html)
@@ -969,6 +1222,12 @@ class PCEditorApp(QMainWindow):
         self.announce(f"Načteno {len(self.library)} písní z {folder}.")
         self.status_label.setText(f"Zdroj: {folder}  →  Výstup: {self.output_folder}  |  {len(self.library)} písní  |  {len(self.setlist)} v setlistu")
         self.save_detail_btn.setEnabled(bool(self.library))
+        try:
+            self.library_print_btn.setEnabled(bool(self.library) and HAS_DOCX)
+            if not HAS_DOCX:
+                self.library_print_btn.setToolTip("Chybí python-docx – nainstalujte: pip install python-docx")
+        except Exception:
+            pass
         # povolit náhled diakritiky pokud je slovník
         try:
             self.repair_diacritic_btn.setEnabled(bool(self.library) and bool(self.diacritic_map))
@@ -1749,6 +2008,51 @@ class PCEditorApp(QMainWindow):
         else:
             QMessageBox.critical(self, "Chyba", res)
             self.announce(f"Word chyba: {res}")
+
+    def export_library_word(self):
+        if not self.library:
+            QMessageBox.warning(self, "Knihovna prázdná", "Nejprve otevřete složku s písněmi (Ctrl+O).")
+            self.announce("Knihovna je prázdná.")
+            return
+        if not HAS_DOCX:
+            QMessageBox.warning(self, "Chybí python-docx", "Nainstalujte závislost:\n  pip install python-docx\n\nPoté restartujte editor.")
+            return
+        dlg = LibraryWordExportDialog(self.library, self.settings, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.announce("Tisk knihovny zrušen.")
+            return
+        songs = dlg.get_selected_songs()
+        if not songs:
+            QMessageBox.warning(self, "Nic nevybráno", "Zaškrtněte alespoň jednu píseň k tisku.")
+            return
+        opts = dlg.get_options()
+        dlg.save_to_settings(opts)
+        title = opts.get("title") or f"Seznam knihovny – {__import__('datetime').datetime.now().strftime('%d. %m. %Y')}"
+        folder = self._ensure_output_folder()
+        if not folder:
+            return
+        # sanitizace názvu souboru
+        safe = "".join(c if c not in r'\/:*?"<>|' else "_" for c in title).strip()
+        if not safe:
+            safe = "Seznam_knihovny"
+        # omezit délku
+        if len(safe) > 80:
+            safe = safe[:80].strip()
+        word_path = os.path.join(folder, f"{safe}.docx")
+        ok, res = playlist_backend.save_library_docx(word_path, title, songs,
+                                            include_duration=bool(opts.get("include_duration")),
+                                            include_tempo=bool(opts.get("include_tempo")),
+                                            include_stops=bool(opts.get("include_stops")))
+        if ok:
+            QMessageBox.information(self, "Word", f"Seznam knihovny uložen do:\n{res}\n\nOtevřete ve Wordu a vytiskněte Ctrl+P.")
+            self.announce(f"Seznam knihovny uložen: {res}")
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+            except Exception:
+                pass
+        else:
+            QMessageBox.critical(self, "Chyba", res)
+            self.announce(f"Chyba tisku knihovny: {res}")
 
     def show_qr(self):
         if not self._require_setlist():

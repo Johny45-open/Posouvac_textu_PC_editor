@@ -31,6 +31,7 @@ SHORTCUTS_DATA: list[tuple[str, str, str, str]] = [
     ("Setlist: posun Níže", "Ctrl+↓", "Alt+↓", "Setlist (F4)"),
     ("Uložit setlist JSON", "Ctrl+J", "Alt+J", "Export • J = JSON"),
     ("Uložit vše (.txt + JSON)", "Ctrl+Shift+S", "Alt+A", "Export • A = vše"),
+    ("Tisk knihovny do Wordu", "Ctrl+P", "Alt+T", "Knihovna • T = Tisk – vyber písně, Word A4, pak Ctrl+P ve Wordu"),
     ("Export HTML", "Ctrl+H", "Alt+H", "Export • H = HTML – F5"),
     ("Export Word", "Ctrl+W", "Alt+W", "Export • W = Word"),
     ("Zobrazit QR", "Ctrl+Shift+Q", "Alt+Q", "Export • Q = QR (Ctrl+Q = ukončit)"),

@@ -10,6 +10,7 @@ Uživatel chce na PC s NVDA v klidu připravit celý setlist (pořadí, tempo/BP
 - **Knihovna**: načíst složku s `.txt` a/nebo `metadata_pisni.csv` exportovaný z telefonu (`Knihovna → Export CSV`).
 - **Detail písně**: náhled řádků, přidat/odebrat zarážku `{stop:N}` před libovolný řádek, nastavit tempo (30–300 BPM) a délku (m:ss).
 - **Setlist**: přidat písně, měnit pořadí (šipky / drag&drop), hromadný souhrn času, uložit jako JSON v3.
+- **Tisk knihovny**: `Knihovna → Tisk seznamu…` (`Ctrl+P`) – výběr písní (checkboxy, filtr, Vybrat vše/Invertovat), volitelné sloupce Délka/Tempo/Zarážky, export tisknutelného `A4 .docx` abecedně (`Seznam knihovny – DD. MM. YYYY`) – tisk ve Wordu `Ctrl+P`.
 - **Dvojí zápis zarážek** (pro maximální kompatibilitu):
   1. **Direktiva v textu** `{stop:2}` / `{pause:4}` – samostatný řádek před cílovým řádkem. Telefon ji přečte i bez změny appky (`lib/chord_pro_parser.dart:40`).
   2. **Pole `stopMarks` v JSON** `[{lineIndex, lineText, bars}]` – DB kotva (`lib/database.dart:StopMarks`). Telefon ji naimportuje do DB (`addStopMarkAtLine`).
@@ -48,6 +49,7 @@ Heslo pro paměť: **S-G-K-V načti, F2-F3-F4 uprav, Ctrl+J/A ulož** + v seznam
 | Setlist výše/níže | `Ctrl+↑/↓` | `Alt+↑/↓` | Setlist `F4` | — |
 | Uložit JSON | `Ctrl+J` | `Alt+J` | Export | **J**SON |
 | Uložit vše | `Ctrl+Shift+S` | `Alt+A` | Export | **A** vše |
+| Tisk knihovny Word | `Ctrl+P` | `Alt+T` | Knihovna/Export | **T**isk – výběr písní, pak `Ctrl+P` ve Wordu |
 | Export HTML/Word | `Ctrl+H/W` | `Alt+H/W` | Export | **H/W** |
 | Zobrazit QR | `Ctrl+Shift+Q` | `Alt+Q` | Export | **Q**R (Ctrl+Q = ukončit) |
 | Kopírovat do schránky | `Ctrl+Alt+C` | — | Export | schránka (Ctrl+Shift+C = CSV) |
