@@ -22,15 +22,15 @@ _STRIP_MAP = {
 }
 
 _ARTIST_DELIMITER = re.compile(
-    r'(\s*,\s*|\s+a\s+|\s+&\s+|\s*;\s*|\s*/\s*|\s+feat\.?\s+|\s+ft\.?\s+|\s+featuring\s+)',
+    r'(\s*,\s*|\s+a\s+|\s+&\s+|\s*;\s*|\s*/\s*|\s+feat[.,]?\s*[, ]*|\s+ft[.,]?\s*[, ]*|\s+featuring\s+)',
     re.IGNORECASE,
 )
 _FEAT_PAREN = re.compile(
-    r'^(.*)\s*\(\s*(feat\.?|ft\.?|featuring)\s+(.+?)\s*\)\s*$',
+    r'^(.*)\s*\(\s*(feat|ft|featuring)[.,]?\s*[, ]*(.+?)\s*\)\s*$',
     re.IGNORECASE,
 )
 _FEAT_BARE = re.compile(
-    r'^(.*)\s+(feat\.?|ft\.?|featuring)\s+(.+)$',
+    r'^(.*)\s+(feat|ft|featuring)[.,]?\s*[, ]*(.+)$',
     re.IGNORECASE,
 )
 
@@ -254,6 +254,7 @@ def load_diacritic_csv(path: str) -> tuple[bool, dict | str, dict]:
     dmap: dict[str, str] = {}
     imported = 0
     skipped = 0
+    expanded = 0
     errors: list[str] = []
     for idx in range(start, len(lines)):
         line = lines[idx].strip()
@@ -288,7 +289,37 @@ def load_diacritic_csv(path: str) -> tuple[bool, dict | str, dict]:
         else:
             # duplicitní stejný záznam – nepočítat jako nový?
             pass
-    return True, dmap, {"imported": imported, "skipped": skipped, "errors": errors, "path": path}
+        # --- expanze kombinovaných klíčů Artist - Title ---
+        # zrcadlí library_model._parse_filename_artist_title: poslední výskyt \s+[-–—]\s+
+        try:
+            # najít poslední oddělovač v raw_key i raw_val (musí být oba)
+            key_matches = list(re.finditer(r'\s+[–—-]\s+', raw_key))
+            val_matches = list(re.finditer(r'\s+[–—-]\s+', raw_val))
+            if key_matches and val_matches:
+                km = key_matches[-1]
+                vm = val_matches[-1]
+                a_raw = raw_key[:km.start()].strip()
+                b_raw = raw_key[km.end():].strip()
+                a_corr = raw_val[:vm.start()].strip()
+                b_corr = raw_val[vm.end():].strip()
+                for part_raw, part_corr in ((a_raw, a_corr), (b_raw, b_corr)):
+                    if not part_raw or not part_corr:
+                        continue
+                    nk = _norm(part_raw)
+                    nv = part_corr.strip()
+                    if not nk or not nv or nk == nv.lower().strip():
+                        continue
+                    if _norm(nv) != nk:
+                        continue
+                    if nk not in dmap:
+                        dmap[nk] = nv
+                        expanded += 1
+                    elif dmap[nk] != nv:
+                        # kolize: nechat původní, zalogovat
+                        errors.append(f"ř.{idx+1}: expanze kolize {nk} -> {nv} (ponecháno {dmap[nk]})")
+        except Exception:
+            pass
+    return True, dmap, {"imported": imported, "skipped": skipped, "expanded": expanded, "errors": errors, "path": path}
 
 
 def find_diacritic_repairs(entries: list[dict], dmap: dict) -> tuple[list[dict], list[dict]]:
@@ -326,9 +357,16 @@ def find_diacritic_repairs(entries: list[dict], dmap: dict) -> tuple[list[dict],
         direct_artist = clean_map.get(_norm(artist))
         resolved_title = direct_title if direct_title is not None and _norm(direct_title) == _norm(title) else None
         resolved_artist = None
-        if composite_artist is not None and _norm(composite_artist) == _norm(artist):
-            resolved_artist = composite_artist
-        elif direct_artist is not None and _norm(direct_artist) == _norm(artist):
+        if composite_artist is not None:
+            # feat normalizace (feat, -> feat.) mění interpunkci, ale je povolená
+            if _norm(composite_artist) == _norm(artist) or re.sub(r'[.,]', '', _norm(composite_artist)) == re.sub(r'[.,]', '', _norm(artist)):
+                resolved_artist = composite_artist
+            else:
+                # i tak povolit pokud rozdíl je jen v diakritice + feat interpunkci – resolve_composite už validoval části
+                # fallback: akceptovat pokud strip_diacritics bez ., je shodný
+                if strip_diacritics(composite_artist).lower().replace('.', '').replace(',', '').strip() == strip_diacritics(artist).lower().replace('.', '').replace(',', '').strip():
+                    resolved_artist = composite_artist
+        if resolved_artist is None and direct_artist is not None and _norm(direct_artist) == _norm(artist):
             resolved_artist = direct_artist
         changed_title = resolved_title is not None and resolved_title != title
         changed_artist = resolved_artist is not None and resolved_artist != artist

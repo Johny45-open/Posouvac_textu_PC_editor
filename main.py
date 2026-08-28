@@ -1133,9 +1133,11 @@ class PCEditorApp(QMainWindow):
         self.diacritic_path = fn
         imp = info.get("imported", 0)
         skip = info.get("skipped", 0)
-        self.diacritic_status.setText(f"Slovník: {Path(fn).name} – {len(dmap)} záznamů (import {imp}, přeskočeno {skip})")
+        expanded = info.get("expanded", 0)
+        exp_txt = f", expandováno {expanded}" if expanded else ""
+        self.diacritic_status.setText(f"Slovník: {Path(fn).name} – {len(dmap)} záznamů (import {imp}{exp_txt}, přeskočeno {skip})")
         self.repair_diacritic_btn.setEnabled(bool(self.library) and bool(self.diacritic_map))
-        msg = f"Slovník načten: {len(dmap)} záznamů z {Path(fn).name}. Import {imp}, přeskočeno {skip}."
+        msg = f"Slovník načten: {len(dmap)} záznamů z {Path(fn).name}. Import {imp}{exp_txt}, přeskočeno {skip}."
         if info.get("errors"):
             # stručně
             msg += f" Chyby: {len(info['errors'])}"
