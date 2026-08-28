@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QSpinBox, QDialogButtonBox, QMessageBox, QGroupBox
 )
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QShortcut, QKeySequence
 import song_parser
 
 
@@ -26,10 +27,12 @@ class StopMarksDialog(QDialog):
         # Info
         info = QLabel(
             "Vyberte řádek písně a přidejte pauzu. Pauza se vloží jako samostatný řádek "
-            "{stop:N} před vybraný řádek a na telefonu zastaví posuv na N taktů."
+            "{stop:N} před vybraný řádek a na telefonu zastaví posuv na N taktů. "
+            "Zkratky: <b>Ctrl+E</b> přidat (alias Alt+P / Enter), <b>Delete</b> odebrat (alias Alt+O), <b>1–9</b> takty, <b>F1</b> tahák."
         )
         info.setWordWrap(True)
         info.setAccessibleName("Nápověda k zarážkám")
+        info.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(info)
 
         # Hlavní splitter: vlevo řádky, vpravo zarážky
@@ -42,8 +45,9 @@ class StopMarksDialog(QDialog):
         self.lines_list = QListWidget()
         self.lines_list.setAccessibleName("Seznam řádků písně")
         self.lines_list.setAccessibleDescription(
-            "Šipkami vyberte řádek, před který se vloží pauza. Číslování odpovídá pořadí v souboru."
+            "Šipkami vyberte řádek, před který se vloží pauza. Číslování odpovídá pořadí v souboru. Zkratka Enter nebo Ctrl+E přidá pauzu. Nápověda F1."
         )
+        self.lines_list.setToolTip("Řádky – Enter nebo Ctrl+E přidá zarážku, 1–9 nastaví takty. Nápověda F1.")
         self.lines_list.setAlternatingRowColors(True)
         self.lines_label.setBuddy(self.lines_list)
         left_layout.addWidget(self.lines_label)
@@ -57,8 +61,9 @@ class StopMarksDialog(QDialog):
         self.marks_list = QListWidget()
         self.marks_list.setAccessibleName("Seznam zarážek")
         self.marks_list.setAccessibleDescription(
-            "Každá položka je pauza v počtu taktů před konkrétním řádkem. Enter nebo tlačítko Odebrat ji smaže."
+            "Každá položka je pauza v počtu taktů před konkrétním řádkem. Delete nebo tlačítko Odebrat ji smaže. Nápověda F1."
         )
+        self.marks_list.setToolTip("Zarážky – Delete odebere. Nápověda F1.")
         self.marks_label.setBuddy(self.marks_list)
         right_layout.addWidget(self.marks_label)
         right_layout.addWidget(self.marks_list)
@@ -75,7 +80,7 @@ class StopMarksDialog(QDialog):
         self.bars_spin.setMinimum(1)
         self.bars_spin.setMaximum(16)
         self.bars_spin.setValue(2)
-        self.bars_spin.setToolTip("Počet taktů pauzy (1–16)")
+        self.bars_spin.setToolTip("Počet taktů pauzy (1–16) – klávesy 1–9 nastaví přímo. Nápověda F1.")
         self.bars_label.setBuddy(self.bars_spin)
         add_row.addWidget(self.bars_label)
         add_row.addWidget(self.bars_spin)
@@ -83,13 +88,16 @@ class StopMarksDialog(QDialog):
         self.add_btn = QPushButton("Přidat zarážku před vybraný řádek (&P)")
         self.add_btn.setAccessibleName("Přidat zarážku před vybraný řádek")
         self.add_btn.setAccessibleDescription(
-            "Vloží {stop:N} před označený řádek. N je počet taktů ze spinboxu."
+            "Vloží {stop:N} před označený řádek. N je počet taktů ze spinboxu. Zkratka Ctrl+E, Enter v seznamu řádků, alias Alt+P. Nápověda F1. E = Edit."
         )
+        self.add_btn.setToolTip("Přidat – zkratka Ctrl+E nebo Enter v seznamu řádků (alias Alt+P). Nápověda F1. E = Edit.")
         self.add_btn.clicked.connect(self._add_mark)
         add_row.addWidget(self.add_btn)
 
         self.remove_btn = QPushButton("Odebrat vybranou zarážku (&O)")
         self.remove_btn.setAccessibleName("Odebrat vybranou zarážku")
+        self.remove_btn.setAccessibleDescription("Odebere vybranou zarážku. Zkratka Delete v seznamu zarážek, alias Alt+O. Nápověda F1.")
+        self.remove_btn.setToolTip("Odebrat – zkratka Delete v seznamu zarážek (alias Alt+O). Nápověda F1.")
         self.remove_btn.clicked.connect(self._remove_mark)
         add_row.addWidget(self.remove_btn)
 
@@ -117,6 +125,7 @@ class StopMarksDialog(QDialog):
 
         # Klávesové zkratky navíc
         self.lines_list.itemDoubleClicked.connect(lambda _: self._add_mark())
+        self._setup_shortcuts()
 
     def _refresh(self):
         content = self.entry.get("content") or ""
@@ -206,6 +215,43 @@ class StopMarksDialog(QDialog):
                     self.parent().statusBar().showMessage(f"Odebrána zarážka {removed.get('bars')} taktů.")
                 except Exception:
                     pass
+
+    def _setup_shortcuts(self):
+        """Zapamatovatelné zkratky dialogu – Ctrl+E přidat, Delete odebrat, 1–9 takty. Bez jednopísmenných bez Ctrl (dle požadavku)."""
+        def _add(seq, slot, parent=None):
+            try:
+                sc = QShortcut(QKeySequence(seq), parent or self)
+                sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                sc.activated.connect(slot)
+                return sc
+            except Exception:
+                return None
+        _add("Ctrl+E", self._add_mark)
+        _add("Ctrl+P", self._add_mark)  # alias Alt+P
+        _add("Delete", self._remove_mark)
+        # Enter v seznamech – přidat / odebrat (WindowShortcut už v main, zde Widget)
+        try:
+            sc = QShortcut(QKeySequence("Return"), self.lines_list)
+            sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc.activated.connect(self._add_mark)
+            sc2 = QShortcut(QKeySequence("Enter"), self.lines_list)
+            sc2.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc2.activated.connect(self._add_mark)
+            sc3 = QShortcut(QKeySequence("Delete"), self.marks_list)
+            sc3.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc3.activated.connect(self._remove_mark)
+        except Exception:
+            pass
+        # 1–9 nastaví takty přímo (bez Ctrl – rychlé, neznalý vidí v tooltipu)
+        for n in "123456789":
+            try:
+                def _mk(v=int(n)):
+                    return lambda: (self.bars_spin.setValue(v), self.bars_spin.setFocus())
+                s = QShortcut(QKeySequence(n), self)
+                s.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                s.activated.connect(_mk())
+            except Exception:
+                pass
 
     def get_result(self) -> list[dict]:
         return list(self.entry.get("stopMarks") or [])

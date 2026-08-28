@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QCheckBox, QComboBox
 )
 from PyQt6.QtCore import Qt, QUrl, QStringListModel, QSettings
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QDesktopServices, QShortcut, QKeySequence, QAction
 
 import playlist_backend
 import library_model
@@ -25,6 +25,12 @@ try:
     HAS_QRCODE = True
 except Exception:
     HAS_QRCODE = False
+
+try:
+    import word_export
+    HAS_DOCX = word_export.HAS_DOCX
+except Exception:
+    HAS_DOCX = False
 
 
 class EditSetlistSongDialog(QDialog):
@@ -126,6 +132,82 @@ class QRDialog(QDialog):
         layout.addWidget(btns)
 
 
+class WordExportDialog(QDialog):
+    """Dialog pro přizpůsobení exportu do Wordu – ukládá volby do QSettings."""
+    def __init__(self, settings: QSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export do Wordu – možnosti")
+        self.setMinimumWidth(480)
+        self.settings = settings
+        layout = QVBoxLayout(self)
+
+        info = QLabel("Zvolte, co má Word obsahovat. Nastavení se zapamatuje pro příště i pro „Uložit vše“.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        def _bool_val(key, default):
+            v = self.settings.value(key, default)
+            if isinstance(v, str):
+                return v.lower() in ("true", "1", "yes")
+            if isinstance(v, bool):
+                return v
+            return bool(v) if v is not None else default
+
+        self.details_check = QCheckBox("Detailní rozpis per píseň (tempo, zarážky, texty na dalších stranách)")
+        self.details_check.setAccessibleName("Detailní rozpis per píseň")
+        self.details_check.setAccessibleDescription("Když zaškrtnuto, za přehledovou tabulkou bude na další straně rozpis každé písně s tempo, zarážkami a volitelně textem.")
+        self.details_check.setChecked(_bool_val("word/includeDetails", True))
+        layout.addWidget(self.details_check)
+
+        self.texts_check = QCheckBox("Včetně textů písní v detailu")
+        self.texts_check.setAccessibleName("Včetně textů písní v detailu")
+        self.texts_check.setAccessibleDescription("Vloží celý text písně do detailu. Vyžaduje detailní rozpis. Respektuje i hlavní checkbox Včetně textů.")
+        # synchronizuj s hlavním save_with_texts – ale pamatuj vlastní
+        self.texts_check.setChecked(_bool_val("word/includeTexts", _bool_val("saveWithTexts", True)))
+        layout.addWidget(self.texts_check)
+
+        self.highlight_check = QCheckBox("Zvýraznit zarážky v textu ([Pauza N] žlutě/tučně)")
+        self.highlight_check.setAccessibleName("Zvýraznit zarážky v textu")
+        self.highlight_check.setChecked(_bool_val("word/highlightStops", True))
+        layout.addWidget(self.highlight_check)
+
+        # závislost: bez detailu nemá smysl texts/highlight – disable
+        def _update_enabled():
+            has_details = self.details_check.isChecked()
+            self.texts_check.setEnabled(has_details)
+            self.highlight_check.setEnabled(has_details and self.texts_check.isChecked())
+        self.details_check.toggled.connect(_update_enabled)
+        self.texts_check.toggled.connect(_update_enabled)
+        _update_enabled()
+
+        hint = QLabel("Tisk: A4 na výšku, okraje 2 cm, záhlaví = název setlistu, zápatí = číslování stran, hlavička tabulky se opakuje.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def get_options(self):
+        return {
+            "include_details": self.details_check.isChecked(),
+            "include_texts": self.texts_check.isChecked() and self.details_check.isChecked(),
+            "highlight_stops": self.highlight_check.isChecked() and self.details_check.isChecked() and self.texts_check.isChecked(),
+        }
+
+    def save_to_settings(self, opts):
+        try:
+            self.settings.setValue("word/includeDetails", bool(opts["include_details"]))
+            self.settings.setValue("word/includeTexts", bool(opts["include_texts"]))
+            self.settings.setValue("word/highlightStops", bool(opts["highlight_stops"]))
+            # synchronizovat hlavní checkbox pro příští Uložit vše
+            self.settings.setValue("saveWithTexts", bool(opts["include_texts"]))
+        except Exception:
+            pass
+
+
 class PCEditorApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -192,13 +274,15 @@ class PCEditorApp(QMainWindow):
         top_row = QHBoxLayout()
         self.open_folder_btn = QPushButton("Otevřít složku s písněmi (&S)")
         self.open_folder_btn.setAccessibleName("Otevřít složku s písněmi")
-        self.open_folder_btn.setAccessibleDescription("Vyberte složku obsahující .txt soubory s texty písní. Lze i rekurzivně.")
+        self.open_folder_btn.setAccessibleDescription("Vyberte složku obsahující .txt soubory s texty písní. Lze i rekurzivně. Zkratka Ctrl+O, alias Alt+S. Nápověda F1.")
+        self.open_folder_btn.setToolTip("Otevřít složku s písněmi – zkratka Ctrl+O (alias Alt+S). Nápověda F1. S = Složka.")
         self.open_folder_btn.clicked.connect(self.open_folder)
         top_row.addWidget(self.open_folder_btn)
 
         self.import_gen_btn = QPushButton("Import z Generátoru (&G)")
         self.import_gen_btn.setAccessibleName("Importovat setlist z Generátoru")
-        self.import_gen_btn.setAccessibleDescription("Importuje JSON playlist z programu Generátor playlistu.")
+        self.import_gen_btn.setAccessibleDescription("Importuje JSON playlist z programu Generátor playlistu. Zkratka Ctrl+G, alias Alt+G. Nápověda F1.")
+        self.import_gen_btn.setToolTip("Import z Generátoru – zkratka Ctrl+G (alias Alt+G). Nápověda F1. G = Generátor.")
         self.import_gen_btn.clicked.connect(self.import_from_generator)
         top_row.addWidget(self.import_gen_btn)
 
@@ -209,14 +293,15 @@ class PCEditorApp(QMainWindow):
 
         self.load_csv_btn = QPushButton("Načíst knihovnu CSV (&C)")
         self.load_csv_btn.setAccessibleName("Načíst knihovnu CSV")
-        self.load_csv_btn.setAccessibleDescription("Vyberte metadata_pisni.csv exportovaný z telefonu pro doplnění délek a temp.")
-        self.load_csv_btn.setToolTip("Telefon: Knihovna → menu → Export CSV pro Generátor → soubor v Download, zkopírujte přes USB na PC.")
+        self.load_csv_btn.setAccessibleDescription("Vyberte metadata_pisni.csv exportovaný z telefonu pro doplnění délek a temp. Zkratka Ctrl+Shift+C, alias Alt+C. Nápověda F1.")
+        self.load_csv_btn.setToolTip("Načíst CSV – zkratka Ctrl+Shift+C (alias Alt+C). Nápověda F1. C = CSV. Telefon: Knihovna → menu → Export CSV pro Generátor → soubor v Download, zkopírujte přes USB na PC.")
         self.load_csv_btn.clicked.connect(self.load_csv)
         top_row.addWidget(self.load_csv_btn)
 
         self.output_btn = QPushButton("Výstupní složka (&V)")
         self.output_btn.setAccessibleName("Nastavit výstupní složku")
-        self.output_btn.setAccessibleDescription("Složka kam se uloží upravené .txt a setlist JSON. Doporučeno např. C:\\Honza\\Texty-pisni_upraveno.")
+        self.output_btn.setAccessibleDescription("Složka kam se uloží upravené .txt a setlist JSON. Doporučeno např. C:\\Honza\\Texty-pisni_upraveno. Zkratka Ctrl+Shift+V, alias Alt+V. Nápověda F1.")
+        self.output_btn.setToolTip("Výstupní složka – zkratka Ctrl+Shift+V (alias Alt+V). Nápověda F1. V = Výstup.")
         self.output_btn.clicked.connect(self.choose_output_folder)
         top_row.addWidget(self.output_btn)
 
@@ -227,14 +312,15 @@ class PCEditorApp(QMainWindow):
         dia_row = QHBoxLayout()
         self.load_diacritic_btn = QPushButton("Načíst slovník (&K)")
         self.load_diacritic_btn.setAccessibleName("Načíst slovník diakritiky")
-        self.load_diacritic_btn.setAccessibleDescription("Vyberte CSV slovník bezDiakritiky,sDiakritikou exportovaný z telefonu. Libovolný název souboru.")
-        self.load_diacritic_btn.setToolTip("Telefon: Nastavení → Slovník diakritiky → Exportovat slovník. Na PC vyberte libovolný *.csv.")
+        self.load_diacritic_btn.setAccessibleDescription("Vyberte CSV slovník bezDiakritiky,sDiakritikou exportovaný z telefonu. Libovolný název souboru. Zkratka Ctrl+K, alias Alt+K. Nápověda F1.")
+        self.load_diacritic_btn.setToolTip("Načíst slovník – zkratka Ctrl+K (alias Alt+K). Nápověda F1. K = slovníK. Telefon: Nastavení → Slovník diakritiky → Exportovat slovník. Na PC vyberte libovolný *.csv.")
         self.load_diacritic_btn.clicked.connect(self.load_diacritic_csv)
         dia_row.addWidget(self.load_diacritic_btn)
 
         self.repair_diacritic_btn = QPushButton("Opravit diakritiku – náhled… (&D)")
         self.repair_diacritic_btn.setAccessibleName("Opravit diakritiku – náhled")
-        self.repair_diacritic_btn.setAccessibleDescription("Zobrazí náhled oprav podle slovníku, umožní potvrdit a přejmenovat soubory.")
+        self.repair_diacritic_btn.setAccessibleDescription("Zobrazí náhled oprav podle slovníku, umožní potvrdit a přejmenovat soubory. Zkratka Ctrl+D, alias Alt+D. Nápověda F1.")
+        self.repair_diacritic_btn.setToolTip("Opravit diakritiku – zkratka Ctrl+D (alias Alt+D). Nápověda F1. D = Diakritika.")
         self.repair_diacritic_btn.clicked.connect(self.show_diacritic_preview)
         self.repair_diacritic_btn.setEnabled(False)
         dia_row.addWidget(self.repair_diacritic_btn)
@@ -319,14 +405,15 @@ class PCEditorApp(QMainWindow):
 
         self.voice_test_btn = QPushButton("Zkouška hlasu")
         self.voice_test_btn.setAccessibleName("Zkouška hlasového výstupu")
-        self.voice_test_btn.setToolTip("Přehraje zkušební hlášku aktuálním enginem (Edge/gTTS vyžaduje internet, při selhání fallback na Auto).")
+        self.voice_test_btn.setAccessibleDescription("Přehraje zkušební hlášku. Zkratka Ctrl+T. Nápověda F1.")
+        self.voice_test_btn.setToolTip("Zkouška hlasu – zkratka Ctrl+T. Nápověda F1. T = Test. Přehraje zkušební hlášku aktuálním enginem (Edge/gTTS vyžaduje internet, při selhání fallback na Auto).")
         self.voice_test_btn.clicked.connect(self.on_voice_test)
         dia_row.addWidget(self.voice_test_btn)
 
         dia_row.addStretch()
         main_layout.addLayout(dia_row)
 
-        self.status_label = QLabel("Začněte: Otevřít složku s písněmi nebo Načíst CSV.")
+        self.status_label = QLabel("Začněte: Otevřít složku s písněmi nebo Načíst CSV. Stiskni F1 pro tahák zkratek.")
         self.status_label.setAccessibleName("Stav")
         self.status_label.setWordWrap(True)
         main_layout.addWidget(self.status_label)
@@ -345,8 +432,9 @@ class PCEditorApp(QMainWindow):
         self.filter_input = QLineEdit()
         self.filter_label.setBuddy(self.filter_input)
         self.filter_input.setAccessibleName("Hledat v knihovně")
-        self.filter_input.setAccessibleDescription("Filtruje podle interpreta nebo názvu. Psaní ihned filtruje seznam.")
-        self.filter_input.setPlaceholderText("Filtr: interpret nebo název")
+        self.filter_input.setAccessibleDescription("Filtruje podle interpreta nebo názvu. Psaní ihned filtruje seznam. Zkratka Ctrl+F nebo F6, fokus F2. Nápověda F1.")
+        self.filter_input.setPlaceholderText("Filtr: interpret nebo název (Ctrl+F, F2)")
+        self.filter_input.setToolTip("Hledat – zkratka Ctrl+F nebo F6, fokus F2. Nápověda F1. F = Filtr.")
         self.filter_input.textChanged.connect(self.refresh_library_list)
         filter_row.addWidget(self.filter_label)
         filter_row.addWidget(self.filter_input)
@@ -355,7 +443,8 @@ class PCEditorApp(QMainWindow):
         self.library_label = QLabel("Knihovna:")
         self.library_list = QListWidget()
         self.library_list.setAccessibleName("Seznam písní v knihovně")
-        self.library_list.setAccessibleDescription("Šipkami vyberte píseň, Enter přidá do setlistu, dvojklik otevře detail. Počet a filtry hlásí stavový řádek.")
+        self.library_list.setAccessibleDescription("Šipkami vyberte píseň, Enter přidá do setlistu, dvojklik otevře detail. Počet a filtry hlásí stavový řádek. Fokus F2, hledat Ctrl+F. Nápověda F1.")
+        self.library_list.setToolTip("Knihovna – F2 fokus, Ctrl+F hledat, Enter přidat do setlistu. Nápověda F1.")
         self.library_label.setBuddy(self.library_list)
         self.library_list.itemSelectionChanged.connect(self.on_library_selection)
         self.library_list.itemDoubleClicked.connect(lambda _: self.add_to_setlist())
@@ -412,13 +501,15 @@ class PCEditorApp(QMainWindow):
 
         self.save_detail_btn = QPushButton("Uložit změny písně (&U)")
         self.save_detail_btn.setAccessibleName("Uložit změny písně")
-        self.save_detail_btn.setAccessibleDescription("Uloží interpreta, název, délku, tempo a zarážky. Textový soubor se přepíše (záloha .bak) s direktivami {stop:N}.")
+        self.save_detail_btn.setAccessibleDescription("Uloží interpreta, název, délku, tempo a zarážky. Textový soubor se přepíše (záloha .bak) s direktivami {stop:N}. Zkratka Ctrl+S, alias Ctrl+U / Alt+U. Nápověda F1. Fokus F3.")
+        self.save_detail_btn.setToolTip("Uložit změny – zkratka Ctrl+S (alias Ctrl+U / Alt+U). Nápověda F1. U = Uložit. Fokus F3 Detail.")
         self.save_detail_btn.clicked.connect(self.save_detail)
         detail_layout.addWidget(self.save_detail_btn)
 
         self.stops_btn = QPushButton("Upravit zarážky… (&Z)")
         self.stops_btn.setAccessibleName("Upravit zarážky")
-        self.stops_btn.setAccessibleDescription("Otevře dialog se seznamem řádků a zarážek. Přidat před vybraný řádek, odebrat, nastavit takty.")
+        self.stops_btn.setAccessibleDescription("Otevře dialog se seznamem řádků a zarážek. Přidat před vybraný řádek, odebrat, nastavit takty. Zkratka Ctrl+E, alias Alt+Z. Nápověda F1. E = Edit.")
+        self.stops_btn.setToolTip("Zarážky – zkratka Ctrl+E (alias Alt+Z). Nápověda F1. E = Edit, Z = Zarážky. Fokus F3.")
         self.stops_btn.clicked.connect(self.open_stops_dialog)
         detail_layout.addWidget(self.stops_btn)
 
@@ -450,7 +541,8 @@ class PCEditorApp(QMainWindow):
         self.setlist_label = QLabel("Písně v setlistu:")
         self.setlist_list = QListWidget()
         self.setlist_list.setAccessibleName("Seznam písní v setlistu")
-        self.setlist_list.setAccessibleDescription("Pořadí měníte tlačítky Výše/Níže nebo přetažením. Dvojklik upraví tempo/délku.")
+        self.setlist_list.setAccessibleDescription("Pořadí měníte tlačítky Výše/Níže (Ctrl+↑/↓, Alt+↑/↓) nebo přetažením. Dvojklik upraví tempo/délku. Fokus F4, Delete odebere. Nápověda F1.")
+        self.setlist_list.setToolTip("Setlist – F4 fokus, Delete odebere, Ctrl+↑/↓ posun. Nápověda F1.")
         self.setlist_label.setBuddy(self.setlist_list)
         self.setlist_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self.setlist_list.setDefaultDropAction(Qt.DropAction.MoveAction)
@@ -463,21 +555,29 @@ class PCEditorApp(QMainWindow):
         order_row = QHBoxLayout()
         self.add_to_setlist_btn = QPushButton("← Přidat z knihovny")
         self.add_to_setlist_btn.setAccessibleName("Přidat vybranou píseň z knihovny do setlistu")
+        self.add_to_setlist_btn.setAccessibleDescription("Přidá vybranou píseň z knihovny. Zkratka Enter v knihovně (F2). Nápověda F1.")
+        self.add_to_setlist_btn.setToolTip("Přidat – zkratka Enter v knihovně (F2). Nápověda F1.")
         self.add_to_setlist_btn.clicked.connect(self.add_to_setlist)
         order_row.addWidget(self.add_to_setlist_btn)
 
         self.up_btn = QPushButton("↑ Výše")
         self.up_btn.setAccessibleName("Posunout píseň v setlistu výše")
+        self.up_btn.setAccessibleDescription("Posune vybranou píseň výše. Zkratka Ctrl+↑, alias Alt+↑. Fokus F4. Nápověda F1.")
+        self.up_btn.setToolTip("Výše – zkratka Ctrl+↑ (alias Alt+↑). Nápověda F1. F4 setlist.")
         self.up_btn.clicked.connect(lambda: self.move_setlist(-1))
         order_row.addWidget(self.up_btn)
 
         self.down_btn = QPushButton("↓ Níže")
         self.down_btn.setAccessibleName("Posunout píseň v setlistu níže")
+        self.down_btn.setAccessibleDescription("Posune vybranou píseň níže. Zkratka Ctrl+↓, alias Alt+↓. Fokus F4. Nápověda F1.")
+        self.down_btn.setToolTip("Níže – zkratka Ctrl+↓ (alias Alt+↓). Nápověda F1. F4 setlist.")
         self.down_btn.clicked.connect(lambda: self.move_setlist(1))
         order_row.addWidget(self.down_btn)
 
         self.remove_btn = QPushButton("Odebrat")
         self.remove_btn.setAccessibleName("Odebrat vybranou píseň ze setlistu")
+        self.remove_btn.setAccessibleDescription("Odebere vybranou píseň. Zkratka Delete v setlistu (F4). Nápověda F1.")
+        self.remove_btn.setToolTip("Odebrat – zkratka Delete v setlistu (F4). Nápověda F1.")
         self.remove_btn.clicked.connect(self.remove_from_setlist)
         order_row.addWidget(self.remove_btn)
 
@@ -500,37 +600,76 @@ class PCEditorApp(QMainWindow):
         row1 = QHBoxLayout()
         self.save_playlist_btn = QPushButton("Uložit setlist JSON (&J)")
         self.save_playlist_btn.setAccessibleName("Uložit setlist jako JSON")
-        self.save_playlist_btn.setAccessibleDescription("Uloží setlist včetně zarážek, tempa a délky. Volitelně včetně textů – telefon pak nemusí mít písně.")
+        self.save_playlist_btn.setAccessibleDescription("Uloží setlist včetně zarážek, tempa a délky. Volitelně včetně textů – telefon pak nemusí mít písně. Zkratka Ctrl+J, alias Alt+J. Nápověda F1. J = JSON.")
+        self.save_playlist_btn.setToolTip("Uložit JSON – zkratka Ctrl+J (alias Alt+J). Nápověda F1. J = JSON.")
         self.save_playlist_btn.clicked.connect(self.save_playlist_json)
         row1.addWidget(self.save_playlist_btn)
 
         self.save_with_texts_check = QCheckBox("Včetně textů (pro příjemce bez knihovny)")
         self.save_with_texts_check.setAccessibleName("Uložit včetně textů písní")
-        self.save_with_texts_check.setChecked(True)
+        try:
+            _swt = self.settings.value("saveWithTexts", self.settings.value("word/includeTexts", True))
+            if isinstance(_swt, str):
+                _swt = _swt.lower() in ("true", "1", "yes")
+            self.save_with_texts_check.setChecked(bool(_swt))
+        except Exception:
+            self.save_with_texts_check.setChecked(True)
+        # persist při změně
+        self.save_with_texts_check.toggled.connect(lambda c: self.settings.setValue("saveWithTexts", bool(c)) or self.settings.setValue("word/includeTexts", bool(c)))
         row1.addWidget(self.save_with_texts_check)
         export_layout.addLayout(row1)
 
         row2 = QHBoxLayout()
         self.save_all_btn = QPushButton("Uložit vše: přepsat .txt + JSON (&A)")
         self.save_all_btn.setAccessibleName("Uložit vše – přepsat texty a uložit setlist")
-        self.save_all_btn.setAccessibleDescription("Zapíše všechny upravené písně (včetně {stop:N} direktiv) do výstupní složky a uloží JSON. Připraveno ke kopírování přes USB do telefonu.")
+        self.save_all_btn.setAccessibleDescription("Zapíše všechny upravené písně (včetně {stop:N} direktiv) do výstupní složky a uloží JSON. Připraveno ke kopírování přes USB do telefonu. Zkratka Ctrl+Shift+S, alias Alt+A. Nápověda F1. A = vše.")
+        self.save_all_btn.setToolTip("Uložit vše – zkratka Ctrl+Shift+S (alias Alt+A). Nápověda F1. A = vše.")
         self.save_all_btn.clicked.connect(self.save_all)
         row2.addWidget(self.save_all_btn)
+        # Word i při Uložit vše – persist
+        self.word_auto_check = QCheckBox("+ Word (.docx)")
+        self.word_auto_check.setAccessibleName("Generovat Word i při Uložit vše")
+        self.word_auto_check.setAccessibleDescription("Když zaškrtnuto, Uložit vše vygeneruje vedle JSON i tisknutelný .docx s poslední volbou z Export Word.")
+        try:
+            _wav = self.settings.value("word/autoWithSaveAll", True)
+            if isinstance(_wav, str):
+                _wav = _wav.lower() in ("true", "1", "yes")
+            self.word_auto_check.setChecked(bool(_wav))
+        except Exception:
+            self.word_auto_check.setChecked(True)
+        self.word_auto_check.toggled.connect(self._on_word_auto_toggled)
+        row2.addWidget(self.word_auto_check)
         export_layout.addLayout(row2)
 
         row3 = QHBoxLayout()
         self.html_btn = QPushButton("Export HTML (&H)")
         self.html_btn.setAccessibleName("Exportovat HTML přehled setlistu")
+        self.html_btn.setAccessibleDescription("Exportuje HTML přehled. Zkratka Ctrl+H, alias Alt+H. Nápověda F1.")
+        self.html_btn.setToolTip("Export HTML – zkratka Ctrl+H (alias Alt+H). Nápověda F1. H = HTML.")
         self.html_btn.clicked.connect(self.export_html)
         row3.addWidget(self.html_btn)
 
+        self.word_btn = QPushButton("Export Word (&W)")
+        self.word_btn.setAccessibleName("Exportovat setlist do Wordu")
+        self.word_btn.setAccessibleDescription("Vygeneruje tisknutelný .docx s přehledovou tabulkou, detaily, zarážkami a číslováním stran. Volby lze přizpůsobit. Zkratka Ctrl+W, alias Alt+W. Nápověda F1.")
+        self.word_btn.setToolTip("Export Word – zkratka Ctrl+W (alias Alt+W). Nápověda F1. W = Word.")
+        self.word_btn.clicked.connect(self.export_word)
+        if not HAS_DOCX:
+            self.word_btn.setEnabled(False)
+            self.word_btn.setToolTip("Chybí python-docx – nainstalujte: pip install python-docx")
+        row3.addWidget(self.word_btn)
+
         self.qr_btn = QPushButton("Zobrazit QR (&Q)")
         self.qr_btn.setAccessibleName("Zobrazit QR kód setlistu")
+        self.qr_btn.setAccessibleDescription("Zobrazí QR kód setlistu. Zkratka Ctrl+Shift+Q, alias Alt+Q. Nápověda F1. Ctrl+Q ukončí aplikaci.")
+        self.qr_btn.setToolTip("Zobrazit QR – zkratka Ctrl+Shift+Q (alias Alt+Q). Nápověda F1. Q = QR. Ctrl+Q = ukončit.")
         self.qr_btn.clicked.connect(self.show_qr)
         row3.addWidget(self.qr_btn)
 
         self.clipboard_btn = QPushButton("Kopírovat do schránky")
         self.clipboard_btn.setAccessibleName("Kopírovat setlist do schránky jako JSON")
+        self.clipboard_btn.setAccessibleDescription("Kopíruje setlist jako JSON. Zkratka Ctrl+Alt+C. Nápověda F1.")
+        self.clipboard_btn.setToolTip("Kopírovat do schránky – zkratka Ctrl+Alt+C. Nápověda F1. (Ctrl+Shift+C je Načíst CSV)")
         self.clipboard_btn.clicked.connect(self.copy_to_clipboard)
         row3.addWidget(self.clipboard_btn)
         row3.addStretch()
@@ -538,8 +677,9 @@ class PCEditorApp(QMainWindow):
 
         # Nápověda USB
         usb_help = QLabel(
-            "USB: Zkopírujte výsledné .txt a .json z výstupní složky přes Průzkumník do "
-            "Telefon\\Download\\Posouvac\\, v telefonu pak Knihovna → Vybrat soubory a Setlisty → Import ze souboru."
+            "USB: Zkopírujte výsledné .txt, .json a .docx z výstupní složky přes Průzkumník do "
+            "Telefon\\Download\\Posouvac\\, v telefonu pak Knihovna → Vybrat soubory a Setlisty → Import ze souboru. "
+            ".docx je tisknutelný přehled setlistu pro kapelu."
         )
         usb_help.setWordWrap(True)
         usb_help.setAccessibleName("Nápověda USB přenos")
@@ -554,7 +694,7 @@ class PCEditorApp(QMainWindow):
         main_layout.addWidget(splitter, 1)
 
         # StatusBar
-        self.statusBar().showMessage("Připraven. Otevřete složku s písněmi.")
+        self.statusBar().showMessage("Připraven. Otevřete složku s písněmi. F1 = tahák zkratek (S-G-K-V, F2-F3-F4).")
 
         # Tab order
         self.setTabOrder(self.open_folder_btn, self.import_gen_btn)
@@ -569,6 +709,246 @@ class PCEditorApp(QMainWindow):
         self.setTabOrder(self.tempo_input, self.save_detail_btn)
         self.setTabOrder(self.save_detail_btn, self.stops_btn)
         self.setTabOrder(self.stops_btn, self.preview_text)
+
+        # Menu + klávesové zkratky (zapamatovatelné, s aliasy)
+        self._create_menubar()
+        self._setup_shortcuts()
+        # jednorázová nápověda F1 při prvním spuštění
+        try:
+            if not self.settings.value("help/shortcutsShown", False) if not isinstance(self.settings.value("help/shortcutsShown", False), str) else self.settings.value("help/shortcutsShown", "false").lower() not in ("true","1","yes"):
+                self.statusBar().showMessage("Tip: Stiskni F1 pro tahák zkratek – S-G-K-V, F2-F3-F4, Ctrl+J/A. Podrž Alt pro podtržená písmena.", 8000)
+        except Exception:
+            pass
+
+    def _create_menubar(self):
+        """MenuBar jako objevitelnost zkratek – neznalý uživatel vidí vše. F1 duplicita."""
+        try:
+            mb = self.menuBar()
+            mb.clear()
+            # Soubor
+            m_file = mb.addMenu("&Soubor")
+            a = m_file.addAction("Otevřít &složku s písněmi…")
+            a.setShortcut(QKeySequence("Ctrl+O"))
+            a.setStatusTip("Otevřít složku s .txt – Ctrl+O / Alt+S – F2 knihovna")
+            a.triggered.connect(self.open_folder)
+            a = m_file.addAction("Import z &Generátoru…")
+            a.setShortcut(QKeySequence("Ctrl+G"))
+            a.setStatusTip("Import JSON z Generátoru – Ctrl+G / Alt+G")
+            a.triggered.connect(self.import_from_generator)
+            a = m_file.addAction("Nastavit &výstupní složku…")
+            a.setShortcut(QKeySequence("Ctrl+Shift+V"))
+            a.setStatusTip("Výstup – Ctrl+Shift+V / Alt+V")
+            a.triggered.connect(self.choose_output_folder)
+            m_file.addSeparator()
+            a = m_file.addAction("U&končit")
+            a.setShortcut(QKeySequence("Ctrl+Q"))
+            a.setStatusTip("Ukončit – Ctrl+Q")
+            a.triggered.connect(self.close)
+
+            # Knihovna
+            m_lib = mb.addMenu("&Knihovna")
+            a = m_lib.addAction("Načíst knihovnu &CSV…")
+            a.setShortcut(QKeySequence("Ctrl+Shift+C"))
+            a.setStatusTip("Načíst metadata_pisni.csv – Ctrl+Shift+C / Alt+C")
+            a.triggered.connect(self.load_csv)
+            a = m_lib.addAction("&Hledat v knihovně")
+            a.setShortcut(QKeySequence("Ctrl+F"))
+            a.setStatusTip("Fokus filtr – Ctrl+F / F6 – F2 knihovna")
+            a.triggered.connect(lambda: (self.tabs.setCurrentIndex(0) if hasattr(self, 'tabs') else None, self.filter_input.setFocus(), self.filter_input.selectAll()))
+
+            # Zobrazit – F2/F3/F4
+            m_view = mb.addMenu("Zo&brazit")
+            a = m_view.addAction("Fokus: &Knihovna")
+            a.setShortcut(QKeySequence("F2"))
+            a.triggered.connect(self._focus_library)
+            a = m_view.addAction("Fokus: &Detail")
+            a.setShortcut(QKeySequence("F3"))
+            a.triggered.connect(self._focus_detail)
+            a = m_view.addAction("Fokus: &Setlist")
+            a.setShortcut(QKeySequence("F4"))
+            a.triggered.connect(self._focus_setlist)
+
+            # Detail
+            m_detail = mb.addMenu("&Detail")
+            a = m_detail.addAction("&Uložit změny písně")
+            a.setShortcut(QKeySequence("Ctrl+S"))
+            a.setStatusTip("Uložit detail – Ctrl+S / Ctrl+U / Alt+U – F3")
+            a.triggered.connect(self.save_detail)
+            a = m_detail.addAction("Upravit &zarážky…")
+            a.setShortcut(QKeySequence("Ctrl+E"))
+            a.setStatusTip("Zarážky – Ctrl+E / Alt+Z – F3")
+            a.triggered.connect(self.open_stops_dialog)
+
+            # Setlist
+            m_set = mb.addMenu("S&etlist")
+            a = m_set.addAction("Přidat z knihovny do setlistu")
+            a.setShortcut(QKeySequence("Return"))
+            a.setStatusTip("Přidat – Enter v knihovně (F2)")
+            a.triggered.connect(self.add_to_setlist)
+            a = m_set.addAction("Odebrat ze setlistu")
+            a.setShortcut(QKeySequence("Delete"))
+            a.setStatusTip("Odebrat – Delete v setlistu (F4)")
+            a.triggered.connect(self.remove_from_setlist)
+            a = m_set.addAction("Posunout &výše")
+            a.setShortcut(QKeySequence("Ctrl+Up"))
+            a.triggered.connect(lambda: self.move_setlist(-1))
+            a = m_set.addAction("Posunout &níže")
+            a.setShortcut(QKeySequence("Ctrl+Down"))
+            a.triggered.connect(lambda: self.move_setlist(1))
+
+            # Export
+            m_ex = mb.addMenu("&Export")
+            a = m_ex.addAction("Uložit setlist &JSON…")
+            a.setShortcut(QKeySequence("Ctrl+J"))
+            a.setStatusTip("JSON – Ctrl+J / Alt+J")
+            a.triggered.connect(self.save_playlist_json)
+            a = m_ex.addAction("Uložit &vše…")
+            a.setShortcut(QKeySequence("Ctrl+Shift+S"))
+            a.setStatusTip("Vše .txt+JSON – Ctrl+Shift+S / Alt+A")
+            a.triggered.connect(self.save_all)
+            a = m_ex.addAction("Export &HTML…")
+            a.setShortcut(QKeySequence("Ctrl+H"))
+            a.triggered.connect(self.export_html)
+            a = m_ex.addAction("Export &Word…")
+            a.setShortcut(QKeySequence("Ctrl+W"))
+            a.triggered.connect(self.export_word)
+            a = m_ex.addAction("Zobrazit &QR…")
+            a.setShortcut(QKeySequence("Ctrl+Shift+Q"))
+            a.setStatusTip("QR – Ctrl+Shift+Q (alias Alt+Q). Nápověda F1.")
+            a.triggered.connect(self.show_qr)
+            a = m_ex.addAction("Kopírovat do &schránky")
+            a.setShortcut(QKeySequence("Ctrl+Alt+C"))
+            a.setStatusTip("Schránka – Ctrl+Alt+C (alias Ctrl+Shift+C je CSV). Nápověda F1.")
+            a.triggered.connect(self.copy_to_clipboard)
+
+            # Nástroje
+            m_tools = mb.addMenu("&Nástroje")
+            a = m_tools.addAction("Načíst &slovník…")
+            a.setShortcut(QKeySequence("Ctrl+K"))
+            a.triggered.connect(self.load_diacritic_csv)
+            a = m_tools.addAction("Opravit &diakritiku…")
+            a.setShortcut(QKeySequence("Ctrl+D"))
+            a.triggered.connect(self.show_diacritic_preview)
+            a = m_tools.addAction("Zkouška &hlasu")
+            a.setShortcut(QKeySequence("Ctrl+T"))
+            a.triggered.connect(self.on_voice_test)
+
+            # Nápověda
+            m_help = mb.addMenu("&Nápověda")
+            a = m_help.addAction("Klávesové &zkratky…")
+            a.setShortcut(QKeySequence("F1"))
+            a.setStatusTip("Tahák – F1 / Ctrl+/ – S-G-K-V, F2-F3-F4, Ctrl+J/A")
+            a.triggered.connect(self.show_shortcuts_help)
+            a = m_help.addAction("O programu…")
+            a.triggered.connect(lambda: QMessageBox.information(self, "O programu", "Posouvač textu – PC Editor\nPřiprav setlist doma, na pódiu jen hraj.\n\nTahák: F1 • S-G-K-V • F2-F3-F4 • Ctrl+J/A"))
+        except Exception:
+            pass
+
+    def _focus_library(self):
+        try:
+            self.tabs.setCurrentIndex(0)
+            self.library_list.setFocus()
+            self.announce("Fokus: Knihovna. Hledat Ctrl+F, Enter přidá do setlistu.")
+        except Exception:
+            pass
+
+    def _focus_detail(self):
+        try:
+            self.tabs.setCurrentIndex(0)
+            if self.current_library_index >= 0:
+                self.artist_input.setFocus()
+                self.artist_input.selectAll()
+            else:
+                self.library_list.setFocus()
+            self.announce("Fokus: Detail písně. Ctrl+S uloží, Ctrl+E zarážky.")
+        except Exception:
+            pass
+
+    def _focus_setlist(self):
+        try:
+            self.tabs.setCurrentIndex(1)
+            self.setlist_list.setFocus()
+            self.announce("Fokus: Setlist. Delete odebere, Ctrl+šipky posun.")
+        except Exception:
+            pass
+
+    def show_shortcuts_help(self):
+        try:
+            from help_shortcuts import HelpShortcutsDialog
+            dlg = HelpShortcutsDialog(self)
+            dlg.exec()
+            try:
+                self.settings.setValue("help/shortcutsShown", True)
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.information(self, "Klávesové zkratky", "F1 tahák není dostupný: " + str(e))
+
+    def _setup_shortcuts(self):
+        """Globální QShortcut s aliasy – obojí české i mezinárodní. WindowShortcut aby fungovaly odkudkoliv."""
+        def _add(seq: str, slot, parent=None, ctx=Qt.ShortcutContext.WindowShortcut):
+            try:
+                sc = QShortcut(QKeySequence(seq), parent or self)
+                sc.setContext(ctx)
+                sc.activated.connect(slot)
+                return sc
+            except Exception:
+                return None
+        # Soubor / Knihovna
+        _add("Ctrl+O", self.open_folder)
+        # Alt+S už je mnemonika tlačítka, explicitně i Ctrl+O alias pro neznalé – Alt+S je automatické
+        _add("Ctrl+G", self.import_from_generator)
+        _add("Ctrl+Shift+C", self.load_csv)
+        _add("Ctrl+Shift+V", self.choose_output_folder)
+        _add("Ctrl+K", self.load_diacritic_csv)
+        _add("Ctrl+D", self.show_diacritic_preview)
+        _add("Ctrl+T", self.on_voice_test)
+        # Hledat
+        _add("Ctrl+F", lambda: (self.filter_input.setFocus(), self.filter_input.selectAll()))
+        _add("F6", lambda: (self.filter_input.setFocus(), self.filter_input.selectAll()))
+        # Fokus F2/F3/F4
+        _add("F2", self._focus_library)
+        _add("F3", self._focus_detail)
+        _add("F4", self._focus_setlist)
+        # Detail – aliasy: Ctrl+S (standard) + Ctrl+U (české Uložit)
+        _add("Ctrl+S", self.save_detail)
+        _add("Ctrl+U", self.save_detail)
+        # Zarážky – Ctrl+E (ne Ctrl+Z!), alias Alt+Z je mnemonika
+        _add("Ctrl+E", self.open_stops_dialog)
+        # Setlist – globální i widget-specifické (bezpečně obojí)
+        _add("Return", self.add_to_setlist)  # Enter odkudkoliv přidá (když je vybrána píseň)
+        _add("Enter", self.add_to_setlist)
+        # Delete / Ctrl+Up/Down pro setlist – WindowShortcut + explicit na widget
+        _add("Delete", self.remove_from_setlist)
+        _add("Ctrl+Up", lambda: self.move_setlist(-1))
+        _add("Ctrl+Down", lambda: self.move_setlist(1))
+        _add("Alt+Up", lambda: self.move_setlist(-1))
+        _add("Alt+Down", lambda: self.move_setlist(1))
+        # Exporty s aliasy (bez kolizí: Ctrl+Q je Ukončit, QR je Ctrl+Shift+Q; CSV je Ctrl+Shift+C, schránka Ctrl+Alt+C)
+        _add("Ctrl+J", self.save_playlist_json)
+        _add("Ctrl+Shift+S", self.save_all)
+        _add("Ctrl+H", self.export_html)
+        _add("Ctrl+W", self.export_word)
+        _add("Ctrl+Shift+Q", self.show_qr)
+        # schránka – primárně Ctrl+Alt+C aby nekolidovala s Ctrl+Shift+C (CSV)
+        _add("Ctrl+Alt+C", self.copy_to_clipboard)
+        # Nápověda – F1 + Ctrl+/ (lomítko)
+        _add("F1", self.show_shortcuts_help)
+        _add("Ctrl+/", self.show_shortcuts_help)
+        _add("Ctrl+?", self.show_shortcuts_help)
+        # Widget-specifické: zajistit Enter/Delete fungují i když je focus v seznamech (WindowShortcut už pokrývá, ale pro jistotu)
+        try:
+            sc = QShortcut(QKeySequence("Return"), self.library_list)
+            sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc.activated.connect(self.add_to_setlist)
+            sc2 = QShortcut(QKeySequence("Enter"), self.library_list)
+            sc2.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc2.activated.connect(self.add_to_setlist)
+            sc3 = QShortcut(QKeySequence("Delete"), self.setlist_list)
+            sc3.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc3.activated.connect(self.remove_from_setlist)
+        except Exception:
+            pass
 
     # --- Knihovna ---
     def open_folder(self):
@@ -1142,6 +1522,42 @@ class PCEditorApp(QMainWindow):
         self.output_folder = folder
         return folder
 
+    def _on_word_auto_toggled(self, checked: bool):
+        try:
+            self.settings.setValue("word/autoWithSaveAll", bool(checked))
+        except Exception:
+            pass
+        self.announce("Word při Uložit vše zapnut." if checked else "Word při Uložit vše vypnut.")
+
+    def _build_export_songs(self, include_texts: bool):
+        """Připraví list písní pro export (doplní content z knihovny dle potřeby)."""
+        out = []
+        for s in self.setlist:
+            e = dict(s)
+            if include_texts and not e.get("content"):
+                for lib in self.library:
+                    if lib.get("filePath") == e.get("filePath"):
+                        e["content"] = lib.get("content")
+                        break
+            if not include_texts:
+                e.pop("content", None)
+            out.append(e)
+        return out
+
+    def _get_stored_word_options(self):
+        def _b(key, default):
+            v = self.settings.value(key, default)
+            if isinstance(v, str):
+                return v.lower() in ("true", "1", "yes")
+            if isinstance(v, bool):
+                return v
+            return bool(v) if v is not None else default
+        return {
+            "include_details": _b("word/includeDetails", True),
+            "include_texts": _b("word/includeTexts", _b("saveWithTexts", self.save_with_texts_check.isChecked())),
+            "highlight_stops": _b("word/highlightStops", True),
+        }
+
     def save_all(self):
         if not self._require_setlist():
             return
@@ -1175,18 +1591,13 @@ class PCEditorApp(QMainWindow):
                     fail.append(msg)
         name = self.setlist_name_input.text().strip()
         include_texts = self.save_with_texts_check.isChecked()
+        try:
+            self.settings.setValue("saveWithTexts", bool(include_texts))
+            self.settings.setValue("word/includeTexts", bool(include_texts))
+        except Exception:
+            pass
         json_path = os.path.join(folder, f"{name.replace(' ', '_')}.json")
-        export_songs = []
-        for s in self.setlist:
-            e = dict(s)
-            if include_texts and not e.get("content"):
-                for lib in self.library:
-                    if lib.get("filePath") == e.get("filePath"):
-                        e["content"] = lib.get("content")
-                        break
-            if not include_texts:
-                e.pop("content", None)
-            export_songs.append(e)
+        export_songs = self._build_export_songs(include_texts)
         # per-setlist TTS meta (obojí: QSettings + JSON)
         try:
             _tts_eng = tts.get_engine()
@@ -1198,9 +1609,36 @@ class PCEditorApp(QMainWindow):
         if not success:
             QMessageBox.critical(self, "Chyba", f"JSON se nepodařilo uložit: {result}")
             return
-        msg = f"Uloženo {ok_count} textů a setlist {result}."
+        # volitelně Word při Uložit vše
+        word_msg = ""
+        if self.word_auto_check.isChecked():
+            if not HAS_DOCX:
+                word_msg = "\nWord: chybí python-docx (pip install python-docx)."
+            else:
+                opts = self._get_stored_word_options()
+                # respektuj aktuální checkbox včetně textů pro Word texty
+                opts["include_texts"] = bool(include_texts and opts["include_details"])
+                opts["highlight_stops"] = bool(opts["highlight_stops"] and opts["include_texts"])
+                word_path = os.path.join(folder, f"{name.replace(' ', '_')}.docx")
+                # pro Word potřebuje texty dle opts
+                word_songs = self._build_export_songs(opts["include_texts"])
+                ok_w, res_w = playlist_backend.save_playlist_docx(
+                    word_path, name, word_songs,
+                    include_details=opts["include_details"],
+                    include_texts=opts["include_texts"],
+                    highlight_stops=opts["highlight_stops"],
+                )
+                if ok_w:
+                    word_msg = f"\nWord: {res_w}"
+                else:
+                    word_msg = f"\nWord chyba: {res_w}"
+                    fail.append(res_w)
+        msg = f"Uloženo {ok_count} textů a setlist {result}.{word_msg}"
         if fail:
-            msg += f"\nChyby: {', '.join(fail[:3])}"
+            # nezdvojovat word chybu
+            short_fail = [f for f in fail[:3] if "Word" not in f]
+            if short_fail:
+                msg += f"\nChyby: {', '.join(short_fail)}"
         QMessageBox.information(self, "Uloženo", msg + "\n\nZkopírujte do telefonu.")
         self.announce(msg)
         self.save_all_btn.setStyleSheet("")
@@ -1257,6 +1695,58 @@ class PCEditorApp(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
         else:
             QMessageBox.critical(self, "Chyba", res)
+
+    def export_word(self):
+        if not self._require_setlist():
+            return
+        if not HAS_DOCX:
+            QMessageBox.warning(self, "Chybí python-docx", "Nainstalujte závislost:\n  pip install python-docx\n\nPoté restartujte editor.")
+            return
+        # synchronizovat dialog s aktuálním stavem hlavního checkboxu
+        try:
+            self.settings.setValue("saveWithTexts", bool(self.save_with_texts_check.isChecked()))
+        except Exception:
+            pass
+        dlg = WordExportDialog(self.settings, self)
+        # předvyplnit dle aktuálního hlavního checkboxu
+        try:
+            dlg.texts_check.setChecked(self.save_with_texts_check.isChecked() and dlg.details_check.isChecked())
+        except Exception:
+            pass
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.announce("Export do Wordu zrušen.")
+            return
+        opts = dlg.get_options()
+        dlg.save_to_settings(opts)
+        # synchronizovat hlavní checkbox
+        try:
+            self.save_with_texts_check.blockSignals(True)
+            self.save_with_texts_check.setChecked(bool(opts["include_texts"]))
+            self.save_with_texts_check.blockSignals(False)
+        except Exception:
+            pass
+        name = self.setlist_name_input.text().strip()
+        folder = self._ensure_output_folder()
+        if not folder:
+            return
+        export_songs = self._build_export_songs(opts["include_texts"])
+        word_path = os.path.join(folder, f"{name.replace(' ', '_')}.docx")
+        ok, res = playlist_backend.save_playlist_docx(
+            word_path, name, export_songs,
+            include_details=opts["include_details"],
+            include_texts=opts["include_texts"],
+            highlight_stops=opts["highlight_stops"],
+        )
+        if ok:
+            QMessageBox.information(self, "Word", f"Word přehled uložen do:\n{res}")
+            self.announce(f"Word uložen: {res}")
+            try:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+            except Exception:
+                pass
+        else:
+            QMessageBox.critical(self, "Chyba", res)
+            self.announce(f"Word chyba: {res}")
 
     def show_qr(self):
         if not self._require_setlist():

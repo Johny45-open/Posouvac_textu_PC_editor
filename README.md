@@ -25,8 +25,37 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Přístupnost (NVDA)
-Všechny ovládací prvky mají `setAccessibleName/Description`, `QLabel.setBuddy`, `setTabOrder`. Dialogy po otevření fokusují první pole. Stavové hlášky přes `statusBar()`. Klávesy: `Alt+P přidat`, `Alt+O odebrat`, `Alt+T tempo`, `Alt+D délka`, `F6` sekce, `Ctrl+S uložit`.
+## Přístupnost (NVDA) + klávesové zkratky (zapamatovatelné pro neznalé)
+
+Všechny ovládací prvky mají `setAccessibleName/Description` (včetně hlášení zkratky), `QLabel.setBuddy`, `setTabOrder`, `QMenuBar` pro objevitelnost a `QShortcut` s `WindowShortcut`. Dialogy po otevření fokusují první pole. Stavové hlášky přes `statusBar()` + `tts.speak()`. **Podrž `Alt` – uvidíš podtržená písmena. `F1` kdykoliv tahák.**
+
+Heslo pro paměť: **S-G-K-V načti, F2-F3-F4 uprav, Ctrl+J/A ulož** + v seznamech `Enter/Delete/↑↓` jako v Průzkumníku.
+
+| Akce | Zkratka | Alias | Kde | Mnemonika |
+|---|---|---|---|---|
+| Otevřít složku | `Ctrl+O` | `Alt+S` | Soubor | **S**ložka – `F2` knihovna |
+| Import z Generátoru | `Ctrl+G` | `Alt+G` | Soubor | **G**enerátor |
+| Načíst CSV | `Ctrl+Shift+C` | `Alt+C` | Knihovna | **C**SV |
+| Výstupní složka | `Ctrl+Shift+V` | `Alt+V` | Soubor | **V**ýstup |
+| Načíst slovník | `Ctrl+K` | `Alt+K` | Nástroje | slovní**K** |
+| Opravit diakritiku | `Ctrl+D` | `Alt+D` | Nástroje | **D**iakritika |
+| Hledat / filtr | `Ctrl+F` | `F6` | Knihovna | **F**iltr – `F2` pak `Ctrl+F` |
+| Fokus Knihovna/Detail/Setlist | `F2` / `F3` / `F4` | — | Zobrazit | 1-2-3 krok |
+| Uložit detail | `Ctrl+S` | `Ctrl+U` / `Alt+U` | Detail | **U**ložit – `F3` |
+| Zarážky | `Ctrl+E` | `Alt+Z` | Detail | **E**dit / **Z**arážky – `F3` |
+| Přidat do setlistu | `Enter` | dvojklik | Knihovna `F2` | — |
+| Odebrat ze setlistu | `Delete` | — | Setlist `F4` | — |
+| Setlist výše/níže | `Ctrl+↑/↓` | `Alt+↑/↓` | Setlist `F4` | — |
+| Uložit JSON | `Ctrl+J` | `Alt+J` | Export | **J**SON |
+| Uložit vše | `Ctrl+Shift+S` | `Alt+A` | Export | **A** vše |
+| Export HTML/Word | `Ctrl+H/W` | `Alt+H/W` | Export | **H/W** |
+| Zobrazit QR | `Ctrl+Shift+Q` | `Alt+Q` | Export | **Q**R (Ctrl+Q = ukončit) |
+| Kopírovat do schránky | `Ctrl+Alt+C` | — | Export | schránka (Ctrl+Shift+C = CSV) |
+| Zkouška hlasu | `Ctrl+T` | — | Nástroje | **T**est |
+| Nápověda tahák | `F1` | `Ctrl+/` | Nápověda | **F1** = pomoc |
+| Zarážky: přidat/odebrat/takty | `Ctrl+E` / `Delete` / `1-9` | `Alt+P/O` | Dialog zarážek | **E/O** + číslo |
+
+Menu: `Soubor | Knihovna | Zobrazit (F2-F4) | Detail | Setlist | Export | Nástroje | Nápověda (F1)`. Tooltip + `AccessibleDescription` u každého tlačítka hlásí zkratku i alias.
 
 ## Formát JSON v3
 Viz `playlist_backend.py:build_playlist_data` – shodný s `lib/song_export.dart:99` + volitelné `stopMarks` na každé písni.
