@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QFormLayout, QSpinBox, QGroupBox, QSplitter, QTabWidget,
     QTextEdit, QCheckBox, QComboBox
 )
-from PyQt6.QtCore import Qt, QUrl, QStringListModel, QSettings
+from PyQt6.QtCore import Qt, QUrl, QStringListModel, QSettings, QStandardPaths, QTimer
 from PyQt6.QtGui import QDesktopServices, QShortcut, QKeySequence, QAction
 
 import playlist_backend
@@ -31,6 +31,230 @@ try:
     HAS_DOCX = word_export.HAS_DOCX
 except Exception:
     HAS_DOCX = False
+
+# --- Perzistence: klíče a helpery ---
+PERSIST_KEYS = {
+    "rememberEnabled": "app/rememberEnabled",
+    "rememberLibrary": "app/rememberLibrary",
+    "rememberCsv": "app/rememberCsv",
+    "rememberDiacritic": "app/rememberDiacritic",
+    "rememberSetlist": "app/rememberSetlist",
+    "rememberOutput": "app/rememberOutput",
+    "maxCount": "history/maxCount",
+    "sourceFolders": "history/sourceFolders",
+    "csvPaths": "history/csvPaths",
+    "diacriticPaths": "history/diacriticPaths",
+    "sourceFolder": "library/sourceFolder",
+    "outputFolder": "library/outputFolder",
+    "csvPath": "csv/path",
+    "diacriticPath": "diacritic/path",
+    "diacriticAutoPreview": "diacritic/autoPreview",
+    "setlistName": "setlist/name",
+    "setlistJson": "setlist/json",
+}
+DEFAULT_MAX_HISTORY = 5
+
+
+def _bool_setting(settings: QSettings, key: str, default: bool) -> bool:
+    try:
+        v = settings.value(key, default)
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes")
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return default
+        return bool(v)
+    except Exception:
+        return default
+
+
+def _get_history_list(settings: QSettings, key: str) -> list[str]:
+    try:
+        raw = settings.value(key, "")
+        if not raw:
+            return []
+        if isinstance(raw, list):
+            return [str(x) for x in raw if str(x).strip()]
+        s = str(raw).strip()
+        if not s:
+            return []
+        try:
+            arr = json.loads(s)
+            if isinstance(arr, list):
+                return [str(x) for x in arr if str(x).strip()]
+        except Exception:
+            pass
+        # fallback: single path
+        return [s] if s else []
+    except Exception:
+        return []
+
+
+def _save_history_list(settings: QSettings, key: str, lst: list[str]):
+    try:
+        settings.setValue(key, json.dumps(lst, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _push_history(settings: QSettings, key: str, path: str, max_count: int):
+    if not path or not str(path).strip():
+        return
+    p = str(path).strip()
+    lst = _get_history_list(settings, key)
+    # deduplikace case-insensitive na Win
+    lst = [x for x in lst if x.lower() != p.lower()]
+    lst.insert(0, p)
+    if max_count < 1:
+        max_count = 1
+    if max_count > 20:
+        max_count = 20
+    lst = lst[:max_count]
+    _save_history_list(settings, key, lst)
+
+
+class MemorySettingsDialog(QDialog):
+    """Nastavení paměti – historie, autosave, pamatování."""
+    def __init__(self, settings: QSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Nastavení paměti")
+        self.setMinimumWidth(520)
+        self.settings = settings
+        layout = QVBoxLayout(self)
+        info = QLabel("Zvolte co si má aplikace pamatovat. Historie ukládá posledních N cest (soubor + registry).")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        self.remember_enabled = QCheckBox("Pamatovat si stav (knihovna, setlist, slovník)")
+        self.remember_enabled.setChecked(_bool_setting(settings, PERSIST_KEYS["rememberEnabled"], True))
+        layout.addWidget(self.remember_enabled)
+        self.remember_lib = QCheckBox("Pamatovat knihovnu (složku písní)")
+        self.remember_lib.setChecked(_bool_setting(settings, PERSIST_KEYS["rememberLibrary"], True))
+        layout.addWidget(self.remember_lib)
+        self.remember_csv = QCheckBox("Pamatovat CSV knihovnu")
+        self.remember_csv.setChecked(_bool_setting(settings, PERSIST_KEYS["rememberCsv"], True))
+        layout.addWidget(self.remember_csv)
+        self.remember_dia = QCheckBox("Pamatovat slovník diakritiky")
+        self.remember_dia.setChecked(_bool_setting(settings, PERSIST_KEYS["rememberDiacritic"], True))
+        layout.addWidget(self.remember_dia)
+        self.remember_setlist = QCheckBox("Pamatovat setlist (autosave)")
+        self.remember_setlist.setChecked(_bool_setting(settings, PERSIST_KEYS["rememberSetlist"], True))
+        layout.addWidget(self.remember_setlist)
+        self.remember_output = QCheckBox("Pamatovat výstupní složku")
+        self.remember_output.setChecked(_bool_setting(settings, PERSIST_KEYS["rememberOutput"], True))
+        layout.addWidget(self.remember_output)
+        self.auto_preview = QCheckBox("Po načtení slovníku rovnou nabídnout náhled oprav (když je co opravovat)")
+        self.auto_preview.setChecked(_bool_setting(settings, PERSIST_KEYS["diacriticAutoPreview"], True))
+        layout.addWidget(self.auto_preview)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Počet položek v historii:"))
+        self.spin = QSpinBox()
+        self.spin.setRange(1, 20)
+        try:
+            v = settings.value(PERSIST_KEYS["maxCount"], DEFAULT_MAX_HISTORY)
+            self.spin.setValue(int(v) if str(v).isdigit() else DEFAULT_MAX_HISTORY)
+        except Exception:
+            self.spin.setValue(DEFAULT_MAX_HISTORY)
+        row.addWidget(self.spin)
+        row.addStretch()
+        layout.addLayout(row)
+        # podzávislost
+        def _upd():
+            en = self.remember_enabled.isChecked()
+            for w in (self.remember_lib, self.remember_csv, self.remember_dia, self.remember_setlist, self.remember_output, self.auto_preview):
+                w.setEnabled(en)
+            self.spin.setEnabled(en)
+        self.remember_enabled.toggled.connect(_upd)
+        _upd()
+        btn_row = QHBoxLayout()
+        self.clear_hist_btn = QPushButton("Vymazat historii")
+        self.clear_hist_btn.clicked.connect(self._clear_hist)
+        btn_row.addWidget(self.clear_hist_btn)
+        self.clear_all_btn = QPushButton("Zapomenout vše")
+        self.clear_all_btn.clicked.connect(self._clear_all)
+        btn_row.addWidget(self.clear_all_btn)
+        self.open_folder_btn = QPushButton("Otevřít složku autosave")
+        self.open_folder_btn.clicked.connect(self._open_autosave)
+        btn_row.addWidget(self.open_folder_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def _clear_hist(self):
+        for k in (PERSIST_KEYS["sourceFolders"], PERSIST_KEYS["csvPaths"], PERSIST_KEYS["diacriticPaths"]):
+            _save_history_list(self.settings, k, [])
+        QMessageBox.information(self, "Historie", "Historie vymazána.")
+
+    def _clear_all(self):
+        for k in PERSIST_KEYS.values():
+            try:
+                self.settings.remove(k)
+            except Exception:
+                pass
+        # soubory
+        try:
+            p = self._state_file()
+            if p and os.path.exists(p):
+                os.unlink(p)
+        except Exception:
+            pass
+        try:
+            p2 = self._autosave_file()
+            if p2 and os.path.exists(p2):
+                os.unlink(p2)
+        except Exception:
+            pass
+        QMessageBox.information(self, "Hotovo", "Vše zapomenuto. Restartujte aplikaci.")
+
+    def _state_file(self):
+        try:
+            base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            if not base:
+                base = os.path.join(str(Path.home()), ".posouvac_pc_editor")
+            return os.path.join(base, "state.json")
+        except Exception:
+            return ""
+
+    def _autosave_file(self):
+        try:
+            base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            if not base:
+                base = os.path.join(str(Path.home()), ".posouvac_pc_editor")
+            return os.path.join(base, "autosave_setlist.json")
+        except Exception:
+            return ""
+
+    def _open_autosave(self):
+        try:
+            base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            if not base:
+                base = os.path.join(str(Path.home()), ".posouvac_pc_editor")
+            os.makedirs(base, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(base))
+        except Exception as e:
+            QMessageBox.warning(self, "Chyba", str(e))
+
+    def save(self):
+        try:
+            self.settings.setValue(PERSIST_KEYS["rememberEnabled"], bool(self.remember_enabled.isChecked()))
+            self.settings.setValue(PERSIST_KEYS["rememberLibrary"], bool(self.remember_lib.isChecked()))
+            self.settings.setValue(PERSIST_KEYS["rememberCsv"], bool(self.remember_csv.isChecked()))
+            self.settings.setValue(PERSIST_KEYS["rememberDiacritic"], bool(self.remember_dia.isChecked()))
+            self.settings.setValue(PERSIST_KEYS["rememberSetlist"], bool(self.remember_setlist.isChecked()))
+            self.settings.setValue(PERSIST_KEYS["rememberOutput"], bool(self.remember_output.isChecked()))
+            self.settings.setValue(PERSIST_KEYS["diacriticAutoPreview"], bool(self.auto_preview.isChecked()))
+            self.settings.setValue(PERSIST_KEYS["maxCount"], int(self.spin.value()))
+            # trim historie na nový max
+            mc = int(self.spin.value())
+            for k in (PERSIST_KEYS["sourceFolders"], PERSIST_KEYS["csvPaths"], PERSIST_KEYS["diacriticPaths"]):
+                lst = _get_history_list(self.settings, k)
+                if len(lst) > mc:
+                    _save_history_list(self.settings, k, lst[:mc])
+        except Exception:
+            pass
 
 
 class EditSetlistSongDialog(QDialog):
@@ -486,6 +710,11 @@ class PCEditorApp(QMainWindow):
             tts.init_after_app()
         except Exception:
             pass
+        # obnova pamatovaného stavu (knihovna, csv, slovník, setlist)
+        try:
+            QTimer.singleShot(300, self._restore_saved_state)
+        except Exception:
+            pass
 
     def announce(self, msg):
         self.statusBar().showMessage(msg, 4000)
@@ -493,6 +722,491 @@ class PCEditorApp(QMainWindow):
         self.live_label.setAccessibleName(msg)
         try:
             tts.speak(msg)
+        except Exception:
+            pass
+
+    # --- persistence helpers ---
+    def _is_remember_enabled(self) -> bool:
+        return _bool_setting(self.settings, PERSIST_KEYS["rememberEnabled"], True)
+
+    def _remember(self, key: str) -> bool:
+        if not self._is_remember_enabled():
+            return False
+        return _bool_setting(self.settings, key, True)
+
+    def _get_max_history(self) -> int:
+        try:
+            v = self.settings.value(PERSIST_KEYS["maxCount"], DEFAULT_MAX_HISTORY)
+            iv = int(str(v).strip()) if str(v).strip().isdigit() else DEFAULT_MAX_HISTORY
+            return max(1, min(20, iv))
+        except Exception:
+            return DEFAULT_MAX_HISTORY
+
+    def _get_state_file(self) -> str:
+        try:
+            base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            if not base:
+                base = os.path.join(str(Path.home()), ".posouvac_pc_editor")
+            os.makedirs(base, exist_ok=True)
+            return os.path.join(base, "state.json")
+        except Exception:
+            return ""
+
+    def _get_autosave_file(self) -> str:
+        try:
+            base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+            if not base:
+                base = os.path.join(str(Path.home()), ".posouvac_pc_editor")
+            os.makedirs(base, exist_ok=True)
+            return os.path.join(base, "autosave_setlist.json")
+        except Exception:
+            return ""
+
+    def _write_state_json(self):
+        if not self._is_remember_enabled():
+            return
+        try:
+            p = self._get_state_file()
+            if not p:
+                return
+            data = {
+                "sourceFolder": self.source_folder or str(self.settings.value(PERSIST_KEYS["sourceFolder"], "") or ""),
+                "outputFolder": self.output_folder or str(self.settings.value(PERSIST_KEYS["outputFolder"], "") or ""),
+                "csvPath": str(self.settings.value(PERSIST_KEYS["csvPath"], "") or ""),
+                "diacriticPath": str(self.settings.value(PERSIST_KEYS["diacriticPath"], "") or ""),
+            }
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _push_history(self, kind: str, path: str):
+        if not self._is_remember_enabled():
+            return
+        try:
+            mc = self._get_max_history()
+            key_map = {"source": PERSIST_KEYS["sourceFolders"], "csv": PERSIST_KEYS["csvPaths"], "diacritic": PERSIST_KEYS["diacriticPaths"]}
+            k = key_map.get(kind)
+            if k:
+                _push_history(self.settings, k, path, mc)
+        except Exception:
+            pass
+
+    def _save_source_folder(self, folder: str):
+        if not self._remember(PERSIST_KEYS["rememberLibrary"]):
+            return
+        try:
+            self.settings.setValue(PERSIST_KEYS["sourceFolder"], folder)
+            self._push_history("source", folder)
+            self._write_state_json()
+        except Exception:
+            pass
+
+    def _save_output_folder(self, folder: str):
+        if not self._remember(PERSIST_KEYS["rememberOutput"]):
+            return
+        try:
+            self.settings.setValue(PERSIST_KEYS["outputFolder"], folder)
+            self._write_state_json()
+        except Exception:
+            pass
+
+    def _save_csv_path(self, path: str):
+        if not self._remember(PERSIST_KEYS["rememberCsv"]):
+            return
+        try:
+            self.settings.setValue(PERSIST_KEYS["csvPath"], path)
+            self._push_history("csv", path)
+            self._write_state_json()
+        except Exception:
+            pass
+
+    def _save_diacritic_path(self, path: str):
+        if not self._remember(PERSIST_KEYS["rememberDiacritic"]):
+            return
+        try:
+            self.settings.setValue(PERSIST_KEYS["diacriticPath"], path)
+            self._push_history("diacritic", path)
+            self._write_state_json()
+        except Exception:
+            pass
+
+    def _autosave_setlist(self):
+        if not self._remember(PERSIST_KEYS["rememberSetlist"]):
+            return
+        try:
+            name = self.setlist_name_input.text().strip() if hasattr(self, 'setlist_name_input') else ""
+            self.settings.setValue(PERSIST_KEYS["setlistName"], name)
+            # serializovat setlist – pro úsporu bez content pokud velký
+            try:
+                payload = json.dumps(self.setlist, ensure_ascii=False)
+                # pokud moc velký (>100k) zkus bez content
+                if len(payload) > 100000:
+                    slim = [{k: v for k, v in s.items() if k != "content"} for s in self.setlist]
+                    payload = json.dumps(slim, ensure_ascii=False)
+                self.settings.setValue(PERSIST_KEYS["setlistJson"], payload)
+            except Exception:
+                pass
+            # souborová záloha
+            try:
+                af = self._get_autosave_file()
+                if af:
+                    data = {"name": name, "songs": self.setlist, "savedAt": __import__("datetime").datetime.now().isoformat()}
+                    # atomicky
+                    tmp = af + ".tmp"
+                    with open(tmp, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp, af)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _load_library_silent(self, folder: str) -> bool:
+        try:
+            ok, data = library_model.load_library_from_folder(folder)
+            if not ok:
+                return False
+            self.library = data
+            self.source_folder = folder
+            # enrich csv pokud existuje
+            if self.csv_library:
+                try:
+                    library_model.enrich_with_csv(self.library, self.csv_library)
+                except Exception:
+                    pass
+            self.refresh_library_list()
+            self.status_label.setText(f"Zdroj: {folder}  →  Výstup: {self.output_folder}  |  {len(self.library)} písní  |  {len(self.setlist)} v setlistu")
+            try:
+                self.library_print_btn.setEnabled(bool(self.library) and HAS_DOCX)
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    def _restore_saved_state(self):
+        if not self._is_remember_enabled():
+            return
+        restored = []
+        errors = []
+        # output folder
+        try:
+            of = str(self.settings.value(PERSIST_KEYS["outputFolder"], "") or "").strip()
+            if not of:
+                # fallback state.json
+                sf = self._get_state_file()
+                if sf and os.path.exists(sf):
+                    try:
+                        with open(sf, 'r', encoding='utf-8') as f:
+                            jd = json.load(f)
+                            of = str(jd.get("outputFolder") or "").strip()
+                    except Exception:
+                        pass
+            if of and os.path.isdir(of) and self._remember(PERSIST_KEYS["rememberOutput"]):
+                self.output_folder = of
+                restored.append(f"výstup {Path(of).name}")
+            elif of:
+                errors.append(f"výstupní složka neexistuje: {of}")
+        except Exception:
+            pass
+        # source folder / knihovna
+        lib_restored = False
+        try:
+            if self._remember(PERSIST_KEYS["rememberLibrary"]):
+                sf = str(self.settings.value(PERSIST_KEYS["sourceFolder"], "") or "").strip()
+                if not sf:
+                    sfile = self._get_state_file()
+                    if sfile and os.path.exists(sfile):
+                        try:
+                            with open(sfile, 'r', encoding='utf-8') as f:
+                                jd = json.load(f)
+                                sf = str(jd.get("sourceFolder") or "").strip()
+                        except Exception:
+                            pass
+                if sf and os.path.isdir(sf):
+                    if self._load_library_silent(sf):
+                        lib_restored = True
+                        restored.append(f"knihovna {len(self.library)} písní z {Path(sf).name}")
+                    else:
+                        errors.append(f"knihovnu z {sf} se nepodařilo načíst")
+                elif sf:
+                    errors.append(f"složka písní neexistuje: {sf}")
+        except Exception as e:
+            errors.append(str(e))
+        # csv
+        try:
+            if self._remember(PERSIST_KEYS["rememberCsv"]):
+                cp = str(self.settings.value(PERSIST_KEYS["csvPath"], "") or "").strip()
+                if not cp:
+                    sfile = self._get_state_file()
+                    if sfile and os.path.exists(sfile):
+                        try:
+                            with open(sfile, 'r', encoding='utf-8') as f:
+                                jd = json.load(f)
+                                cp = str(jd.get("csvPath") or "").strip()
+                        except Exception:
+                            pass
+                if cp and os.path.exists(cp):
+                    ok, data = playlist_backend.load_csv_library(cp)
+                    if ok:
+                        self.csv_library = data
+                        if self.library:
+                            try:
+                                library_model.enrich_with_csv(self.library, self.csv_library)
+                                self.refresh_library_list()
+                            except Exception:
+                                pass
+                        restored.append(f"CSV {len(data)}")
+                    else:
+                        errors.append(f"CSV chyba: {data}")
+                elif cp:
+                    errors.append(f"CSV neexistuje: {Path(cp).name}")
+        except Exception:
+            pass
+        # diacritic
+        try:
+            if self._remember(PERSIST_KEYS["rememberDiacritic"]):
+                dp = str(self.settings.value(PERSIST_KEYS["diacriticPath"], "") or "").strip()
+                if not dp:
+                    sfile = self._get_state_file()
+                    if sfile and os.path.exists(sfile):
+                        try:
+                            with open(sfile, 'r', encoding='utf-8') as f:
+                                jd = json.load(f)
+                                dp = str(jd.get("diacriticPath") or "").strip()
+                        except Exception:
+                            pass
+                if dp and os.path.exists(dp):
+                    ok, dmap, info = diacritic.load_diacritic_csv(dp)
+                    if ok:
+                        self.diacritic_map = dmap
+                        self.diacritic_info = info
+                        self.diacritic_path = dp
+                        imp = info.get("imported", 0)
+                        exp = info.get("expanded", 0)
+                        exp_txt = f", expand {exp}" if exp else ""
+                        self.diacritic_status.setText(f"Slovník: {Path(dp).name} – {len(dmap)} záznamů (import {imp}{exp_txt})")
+                        self.repair_diacritic_btn.setEnabled(bool(self.library) and bool(self.diacritic_map))
+                        restored.append(f"slovník {len(dmap)} ({Path(dp).name})")
+                        # auto-náhled když je co opravovat
+                        if lib_restored and _bool_setting(self.settings, PERSIST_KEYS["diacriticAutoPreview"], True):
+                            try:
+                                cands, _ = library_model.find_diacritic_repairs(self.library, self.diacritic_map)
+                                if cands:
+                                    self.statusBar().showMessage(f"Slovník nalezl {len(cands)} návrhů – otevírám náhled…", 6000)
+                                    QTimer.singleShot(800, self.show_diacritic_preview)
+                            except Exception:
+                                pass
+                    else:
+                        errors.append(f"slovník chyba: {dmap}")
+                elif dp:
+                    errors.append(f"slovník neexistuje: {Path(dp).name}")
+        except Exception:
+            pass
+        # setlist
+        try:
+            if self._remember(PERSIST_KEYS["rememberSetlist"]):
+                sj = str(self.settings.value(PERSIST_KEYS["setlistJson"], "") or "").strip()
+                sname = str(self.settings.value(PERSIST_KEYS["setlistName"], "") or "").strip()
+                # fallback soubor
+                if not sj:
+                    af = self._get_autosave_file()
+                    if af and os.path.exists(af):
+                        try:
+                            with open(af, 'r', encoding='utf-8') as f:
+                                jd = json.load(f)
+                                sj = json.dumps(jd.get("songs") or [], ensure_ascii=False)
+                                sname = str(jd.get("name") or sname)
+                        except Exception:
+                            pass
+                if sj:
+                    try:
+                        arr = json.loads(sj)
+                        if isinstance(arr, list):
+                            self.setlist = arr
+                            if sname:
+                                try:
+                                    self.setlist_name_input.setText(sname)
+                                except Exception:
+                                    pass
+                            self.refresh_setlist()
+                            restored.append(f"setlist {len(arr)} písní" + (f" '{sname}'" if sname else ""))
+                    except Exception:
+                        pass
+                elif sname:
+                    try:
+                        self.setlist_name_input.setText(sname)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # banner + hláška
+        if restored:
+            msg = "Obnoveno: " + ", ".join(restored) + ". Změnit v Soubor / Knihovna / Nástroje."
+            if errors:
+                msg += " | Upozornění: " + "; ".join(errors[:2])
+            self.statusBar().showMessage(msg, 8000)
+            try:
+                self.status_label.setText(msg + " | " + self.status_label.text())
+            except Exception:
+                pass
+            self.announce(msg)
+            # banner
+            try:
+                if hasattr(self, 'restore_banner'):
+                    self.restore_banner.setText("↻ " + msg)
+                    self.restore_banner.setVisible(True)
+                    QTimer.singleShot(15000, lambda: self.restore_banner.setVisible(False))
+            except Exception:
+                pass
+            try:
+                self._rebuild_recent_menus()
+            except Exception:
+                pass
+        elif errors:
+            msg = "Obnovení selhalo: " + "; ".join(errors[:3])
+            self.statusBar().showMessage(msg, 6000)
+
+    def _rebuild_recent_menus(self):
+        try:
+            if not hasattr(self, '_recent_menus'):
+                return
+            mc = self._get_max_history()
+            for kind, menu in self._recent_menus.items():
+                menu.clear()
+                key = {"source": PERSIST_KEYS["sourceFolders"], "csv": PERSIST_KEYS["csvPaths"], "diacritic": PERSIST_KEYS["diacriticPaths"]}.get(kind)
+                if not key:
+                    continue
+                lst = _get_history_list(self.settings, key)[:mc]
+                if not lst:
+                    a = menu.addAction("(prázdné)")
+                    a.setEnabled(False)
+                else:
+                    for p in lst:
+                        a = menu.addAction(Path(p).name + f"  — {p}")
+                        a.setToolTip(p)
+                        # lambda capture
+                        a.triggered.connect(lambda checked=False, pp=p, kk=kind: self._open_recent(kk, pp))
+                menu.addSeparator()
+                a = menu.addAction("Vymazat historii…")
+                a.triggered.connect(lambda checked=False, kk=kind: self._clear_recent_kind(kk))
+        except Exception:
+            pass
+
+    def _open_recent(self, kind: str, path: str):
+        try:
+            if kind == "source":
+                if os.path.isdir(path):
+                    self.source_folder = path
+                    if not self.output_folder:
+                        self.output_folder = path.rstrip("\\/") + "_upraveno"
+                    ok, data = library_model.load_library_from_folder(path)
+                    if not ok:
+                        QMessageBox.critical(self, "Chyba", str(data))
+                        return
+                    self.library = data
+                    if self.csv_library:
+                        library_model.enrich_with_csv(self.library, self.csv_library)
+                    self.refresh_library_list()
+                    self.announce(f"Načteno {len(self.library)} písní z {path}.")
+                    self.status_label.setText(f"Zdroj: {path}  →  Výstup: {self.output_folder}  |  {len(self.library)} písní")
+                    self._save_source_folder(path)
+                    self._rebuild_recent_menus()
+                    self.restore_banner.setVisible(False)
+                else:
+                    QMessageBox.warning(self, "Neexistuje", f"Složka neexistuje:\n{path}")
+            elif kind == "csv":
+                if os.path.exists(path):
+                    ok, data = playlist_backend.load_csv_library(path)
+                    if not ok:
+                        QMessageBox.critical(self, "Chyba", str(data))
+                        return
+                    self.csv_library = data
+                    if self.library:
+                        library_model.enrich_with_csv(self.library, self.csv_library)
+                        self.refresh_library_list()
+                    self.announce(f"CSV načteno: {len(data)}")
+                    self._save_csv_path(path)
+                    self._rebuild_recent_menus()
+                else:
+                    QMessageBox.warning(self, "Neexistuje", path)
+            elif kind == "diacritic":
+                if os.path.exists(path):
+                    ok, dmap, info = diacritic.load_diacritic_csv(path)
+                    if not ok:
+                        QMessageBox.critical(self, "Chyba", str(dmap))
+                        return
+                    self.diacritic_map = dmap
+                    self.diacritic_info = info
+                    self.diacritic_path = path
+                    self.diacritic_status.setText(f"Slovník: {Path(path).name} – {len(dmap)} záznamů")
+                    self.repair_diacritic_btn.setEnabled(bool(self.library) and bool(self.diacritic_map))
+                    self.announce(f"Slovník načten: {len(dmap)}")
+                    self._save_diacritic_path(path)
+                    self._rebuild_recent_menus()
+                else:
+                    QMessageBox.warning(self, "Neexistuje", path)
+        except Exception as e:
+            QMessageBox.critical(self, "Chyba", str(e))
+
+    def _clear_recent_kind(self, kind: str):
+        try:
+            key = {"source": PERSIST_KEYS["sourceFolders"], "csv": PERSIST_KEYS["csvPaths"], "diacritic": PERSIST_KEYS["diacriticPaths"]}.get(kind)
+            if key:
+                _save_history_list(self.settings, key, [])
+                self._rebuild_recent_menus()
+                self.announce("Historie vymazána.")
+        except Exception:
+            pass
+
+    def show_memory_settings(self):
+        try:
+            dlg = MemorySettingsDialog(self.settings, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                dlg.save()
+                self._rebuild_recent_menus()
+                self.announce("Nastavení paměti uloženo.")
+        except Exception as e:
+            QMessageBox.warning(self, "Chyba", str(e))
+
+    def _clear_all_memory(self):
+        try:
+            ret = QMessageBox.question(self, "Zapomenout vše", "Vymazat veškerou pamatovanou paměť (složky, CSV, slovník, setlist, historii)?\nSoubory na disku zůstanou, smaže se jen paměť aplikace.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+            for k in PERSIST_KEYS.values():
+                try:
+                    self.settings.remove(k)
+                except Exception:
+                    pass
+            try:
+                p = self._get_state_file()
+                if p and os.path.exists(p):
+                    os.unlink(p)
+            except Exception:
+                pass
+            try:
+                p2 = self._get_autosave_file()
+                if p2 and os.path.exists(p2):
+                    os.unlink(p2)
+            except Exception:
+                pass
+            self._rebuild_recent_menus()
+            self.restore_banner.setVisible(False)
+            self.announce("Paměť vymazána.")
+            QMessageBox.information(self, "Hotovo", "Paměť vymazána. Při příštím spuštění se nic neobnoví.")
+        except Exception as e:
+            QMessageBox.warning(self, "Chyba", str(e))
+
+    def closeEvent(self, event):
+        try:
+            self._autosave_setlist()
+            self._write_state_json()
+        except Exception:
+            pass
+        try:
+            event.accept()
         except Exception:
             pass
 
@@ -649,6 +1363,18 @@ class PCEditorApp(QMainWindow):
         self.status_label.setWordWrap(True)
         main_layout.addWidget(self.status_label)
         main_layout.addWidget(self.live_label)
+        # banner obnovení
+        self.restore_banner = QLabel("")
+        self.restore_banner.setWordWrap(True)
+        self.restore_banner.setStyleSheet("background:#e8f5e9; border:1px solid #a5d6a7; padding:6px; border-radius:4px; color:#2e7d32;")
+        self.restore_banner.setVisible(False)
+        self.restore_banner.setAccessibleName("Obnovení stavu")
+        # klikací banner – skrýt po kliku
+        try:
+            self.restore_banner.mousePressEvent = lambda e: self.restore_banner.setVisible(False)
+        except Exception:
+            pass
+        main_layout.addWidget(self.restore_banner)
 
         # --- Splitter: knihovna vlevo, pravý panel ---
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -777,6 +1503,10 @@ class PCEditorApp(QMainWindow):
         self.setlist_name_label.setBuddy(self.setlist_name_input)
         self.setlist_name_input.setAccessibleName("Název setlistu")
         self.setlist_name_input.setPlaceholderText("Např. Oslava, Letní kino")
+        try:
+            self.setlist_name_input.textChanged.connect(lambda _: self._autosave_setlist())
+        except Exception:
+            pass
         name_row.addWidget(self.setlist_name_label)
         name_row.addWidget(self.setlist_name_input)
         setlist_layout.addLayout(name_row)
@@ -982,6 +1712,16 @@ class PCEditorApp(QMainWindow):
             a.setShortcut(QKeySequence("Ctrl+Shift+V"))
             a.setStatusTip("Výstup – Ctrl+Shift+V / Alt+V")
             a.triggered.connect(self.choose_output_folder)
+            # Nedávné – historie
+            m_recent = m_file.addMenu("Nedávné…")
+            self._recent_menus = {}
+            self._recent_menus["source"] = m_recent.addMenu("Knihovny (složky)…")
+            self._recent_menus["csv"] = m_recent.addMenu("CSV knihovny…")
+            self._recent_menus["diacritic"] = m_recent.addMenu("Slovníky…")
+            try:
+                self._rebuild_recent_menus()
+            except Exception:
+                pass
             m_file.addSeparator()
             a = m_file.addAction("U&končit")
             a.setShortcut(QKeySequence("Ctrl+Q"))
@@ -1084,6 +1824,12 @@ class PCEditorApp(QMainWindow):
             a = m_tools.addAction("Zkouška &hlasu")
             a.setShortcut(QKeySequence("Ctrl+T"))
             a.triggered.connect(self.on_voice_test)
+            m_tools.addSeparator()
+            a = m_tools.addAction("Nastavení paměti…")
+            a.setStatusTip("Pamatování knihovny/setlistu/slovníku, historie, autosave")
+            a.triggered.connect(self.show_memory_settings)
+            a = m_tools.addAction("Zapomenout vše (vymazat paměť)…")
+            a.triggered.connect(self._clear_all_memory)
 
             # Nápověda
             m_help = mb.addMenu("&Nápověda")
@@ -1233,6 +1979,12 @@ class PCEditorApp(QMainWindow):
             self.repair_diacritic_btn.setEnabled(bool(self.library) and bool(self.diacritic_map))
         except Exception:
             pass
+        try:
+            self._save_source_folder(folder)
+            self._rebuild_recent_menus()
+            self.restore_banner.setVisible(False)
+        except Exception:
+            pass
 
     def import_from_generator(self):
         fn, _ = QFileDialog.getOpenFileName(self, "Import setlistu z Generátoru", 
@@ -1265,6 +2017,10 @@ class PCEditorApp(QMainWindow):
         except Exception:
             pass
         self.refresh_setlist()
+        try:
+            self._autosave_setlist()
+        except Exception:
+            pass
         self.announce(f"Importováno {len(enriched)} písní z {data.get('name')}. Chybějících v knihovně: {len(missing)}.")
         if missing:
             msg = "\n".join([f"{m.get('artist')} - {m.get('title')}" for m in missing[:10]])
@@ -1285,6 +2041,11 @@ class PCEditorApp(QMainWindow):
             self.refresh_library_list()
         self.announce(f"Knihovna načtena: {len(data)} písní.")
         self.status_label.setText(f"CSV: {len(data)} písní. " + self.status_label.text())
+        try:
+            self._save_csv_path(fn)
+            self._rebuild_recent_menus()
+        except Exception:
+            pass
 
     def on_voice_toggled(self, checked: bool):
         tts.set_enabled(bool(checked))
@@ -1402,6 +2163,11 @@ class PCEditorApp(QMainWindow):
             msg += f" Chyby: {len(info['errors'])}"
         self.announce(msg)
         self.status_label.setText(msg + " | " + self.status_label.text())
+        try:
+            self._save_diacritic_path(fn)
+            self._rebuild_recent_menus()
+        except Exception:
+            pass
 
     def show_diacritic_preview(self):
         if not self.library:
@@ -1549,6 +2315,10 @@ class PCEditorApp(QMainWindow):
                         s["title"] = c.get("newTitle") or s.get("title")
         self.refresh_library_list()
         self.refresh_setlist()
+        try:
+            self._autosave_setlist()
+        except Exception:
+            pass
         self._mark_dirty()
         msg2 = f"Opraveno {res['dbUpdated']} názvů."
         if rename:
@@ -1569,6 +2339,10 @@ class PCEditorApp(QMainWindow):
             self.output_folder = folder
             self.announce(f"Výstupní složka: {folder}")
             self.status_label.setText(f"Výstup: {folder}")
+            try:
+                self._save_output_folder(folder)
+            except Exception:
+                pass
 
     def refresh_library_list(self):
         filt = self.filter_input.text().strip().lower()
@@ -1639,6 +2413,11 @@ class PCEditorApp(QMainWindow):
         self.preview_text.setPlainText(entry["content"][:4000])
         self.refresh_library_list()
         self.refresh_setlist()
+        try:
+            # pokud se změnil název/délka/tempo u písně co je v setlistu, synchronizuj autosave při příští editaci stop?
+            pass
+        except Exception:
+            pass
         self.announce(f"Uloženo v paměti: {new_artist} – {new_title}. Pro zápis na disk použijte Uložit vše.")
         self._mark_dirty()
 
@@ -1657,6 +2436,10 @@ class PCEditorApp(QMainWindow):
                     s["stopMarks"] = list(entry.get("stopMarks") or [])
                     s["content"] = entry["content"]
             self.refresh_setlist()
+            try:
+                self._autosave_setlist()
+            except Exception:
+                pass
             self._mark_dirty()
             self.announce(f"Zarážky uloženy v paměti ({len(entry.get('stopMarks') or [])} zarážek).")
 
@@ -1686,6 +2469,10 @@ class PCEditorApp(QMainWindow):
         }
         self.setlist.append(copy)
         self.refresh_setlist()
+        try:
+            self._autosave_setlist()
+        except Exception:
+            pass
         self.announce(f"Přidána do setlistu: {copy['artist']} – {copy['title']}")
 
     def remove_from_setlist(self):
@@ -1695,6 +2482,10 @@ class PCEditorApp(QMainWindow):
             return
         removed = self.setlist.pop(row)
         self.refresh_setlist()
+        try:
+            self._autosave_setlist()
+        except Exception:
+            pass
         self.announce(f"Odebrána: {removed.get('title')}")
 
     def move_setlist(self, delta: int):
@@ -1706,6 +2497,10 @@ class PCEditorApp(QMainWindow):
             self.setlist.insert(new_row, self.setlist.pop(row))
             self.refresh_setlist()
             self.setlist_list.setCurrentRow(new_row)
+            try:
+                self._autosave_setlist()
+            except Exception:
+                pass
             self.announce(f"Přesunuta na {new_row+1}. místo")
 
     def on_setlist_reordered(self, *args):
@@ -1718,6 +2513,10 @@ class PCEditorApp(QMainWindow):
         if len(new_order) == len(self.setlist):
             self.setlist = new_order
             self.refresh_setlist()
+            try:
+                self._autosave_setlist()
+            except Exception:
+                pass
 
     def edit_setlist_song(self):
         row = self.setlist_list.currentRow()
@@ -1732,6 +2531,10 @@ class PCEditorApp(QMainWindow):
                 return
             self.setlist[row] = res
             self.refresh_setlist()
+            try:
+                self._autosave_setlist()
+            except Exception:
+                pass
             self.announce(f"Upravena: {res.get('title')}")
 
     def refresh_setlist(self):

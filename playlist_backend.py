@@ -460,84 +460,132 @@ def get_qr_payload(name, songs):
 # --- StopMarks helpers pro PC editor ---
 
 def extract_stop_marks_from_content(content: str) -> list[dict]:
-    """Z direktiv {stop:N}/{pause:N} v textu → [{lineText,lineIndex,bars}]."""
+    """
+    Z direktiv {stop:N}/{pause:N} v textu → [{lineText,lineIndex,bars}].
+
+    lineIndex = index CÍLOVÉHO řádku v prostoru textu BEZ stop direktiv,
+    lineText  = text tohoto cílového řádku (kontrolní kotva, nikoli způsob
+    rozlišení opakovaných řádků).
+    """
     try:
         import song_parser
     except Exception:
         return []
-    ordered = song_parser.ordered_lines(content or "")
-    marks = []
-    for m in song_parser.stop_marks_in_lines(content or ""):
-        idx = m["index"]
-        bars = m["bars"]
-        # lineText je následující neprázdný textový řádek po direktivě – pro korelaci
-        # hledáme první textový řádek za direktivou
-        next_text = ""
-        for j in range(idx + 1, len(ordered)):
-            txt = song_parser.line_text(ordered[j]).strip()
-            if txt and not any(e.type == song_parser.ElementType.stopMark for e in ordered[j]):
-                next_text = txt
-                break
-        marks.append({"lineText": next_text, "lineIndex": idx, "bars": int(bars) if bars else 2})
+    phys = song_parser.split_physical_lines(content or "")
+    clean_lines = [(p, kind, payload) for (p, kind, payload) in phys if kind in ("text", "comment")]
+    marks: list[dict] = []
+    clean_count = 0
+    for p, kind, payload in phys:
+        if kind == "stop":
+            bars = song_parser.parse_directive_bars(payload)
+            if bars <= 0:
+                bars = 2
+            # Cílový řádek = nejbližší následující čistý řádek.
+            next_clean = next((c for c in clean_lines if c[0] > p), None)
+            line_text_val = ""
+            if next_clean is not None:
+                line_text_val = song_parser.clean_line_text(next_clean[1], next_clean[2])
+            marks.append({"lineText": line_text_val, "lineIndex": clean_count, "bars": int(bars)})
+        elif kind in ("text", "comment"):
+            clean_count += 1
     return marks
 
 
-def file_content_with_stop_marks_applied(original_content: str, stop_marks: list[dict]) -> str:
+def _remove_all_stop_directives(content: str) -> str:
+    """Odstraní všechny stop direktivy {stop:N}/{pause:N} (jako celé fyzické řádky)."""
+    try:
+        import song_parser
+    except Exception:
+        return content
+    drop = {p for (p, kind, _pay) in song_parser.split_physical_lines(content) if kind == "stop"}
+    raw_lines = song_parser.file_lines_raw(content)
+    return "\n".join(raw for i, raw in enumerate(raw_lines) if i not in drop)
+
+
+def file_content_with_stop_marks_applied(
+    original_content: str,
+    stop_marks: list[dict],
+    errors: list | None = None,
+) -> str:
     """
     Vezme původní obsah a seznam zarážek [{lineText,lineIndex,bars}] a vrátí obsah
     s vloženými direktivami {stop:N} před odpovídající řádky.
-    Odstraní staré direktivy a vloží nové – idempotentní.
+
+    lineIndex = index cílového řádku v prostoru BEZ stop direktiv (stejné významu
+    jako v extract_stop_marks_from_content a insert_stop_directive).
+
+    Postup: nejdřív odstraní všechny existující stop direktivy (jednotná čistá
+    reprezentace), pak vloží požadované direktivy sestupně podle indexu, aby
+    vkládání jedné zarážky neposouvalo cíl zarážek s nižším indexem.
+
+    Pokud některou zarážku nelze spolehlivě umístit (neplatný index, neshoda
+    lineIndex/lineText, nejednoznačný text bez indexu), operace se přeruší
+    a vrátí se PŮVODNÍ obsah beze změny (žádná direktiva se nevloží ani
+    neodstraní). Důvod se zapíše do volitelného seznamu errors.
     """
     try:
         import song_parser
     except Exception:
         return original_content
-    # 1) odstranit všechny existující stop direktivy
-    cleaned = original_content
-    for _ in range(20):  # max 20 iterací
-        ordered = song_parser.ordered_lines(cleaned)
-        found = None
-        for i, ln in enumerate(ordered):
-            if any(e.type == song_parser.ElementType.stopMark for e in ln):
-                found = i
-                break
-        if found is None:
-            break
-        cleaned, _ = song_parser.remove_stop_directive_at(cleaned, found)
-    # 2) vložit nové seřazené podle lineIndex sestupně (aby se indexy neposouvaly)
-    #    pokud lineIndex None, použijeme lineText search
-    ordered_clean = song_parser.ordered_lines(cleaned)
-    # map lineText -> index
-    text_to_idx = {}
-    for idx, ln in enumerate(ordered_clean):
-        t = song_parser.line_text(ln)
-        if t and t not in text_to_idx:
-            text_to_idx[t] = idx
-    # seřadit marks podle cílového indexu sestupně
-    def target_idx(m):
-        if m.get("lineIndex") is not None:
-            return int(m["lineIndex"])
-        return text_to_idx.get((m.get("lineText") or "").strip(), 9999)
-    sorted_marks = sorted(stop_marks, key=target_idx, reverse=True)
-    result = cleaned
-    for m in sorted_marks:
-        bars = max(1, min(16, int(m.get("bars") or 2)))
-        line_text = (m.get("lineText") or "").strip()
-        # najít index znovu (protože se posouvá)
-        ordered_now = song_parser.ordered_lines(result)
-        idx = m.get("lineIndex")
-        if idx is not None:
+
+    def _fail(msg: str) -> str:
+        if errors is not None:
+            errors.append(msg)
+        return original_content
+
+    # 1) Jednotná čistá reprezentace – odstranit všechny stop direktivy.
+    cleaned = _remove_all_stop_directives(original_content)
+
+    # 2) Připravit zarážky v čistém indexovém prostoru.
+    clean = [(p, kind, payload) for (p, kind, payload) in song_parser.split_physical_lines(cleaned)
+             if kind in ("text", "comment")]
+
+    prepared: list[tuple[int, int, str | None]] = []
+    for m in (stop_marks or []):
+        if not isinstance(m, dict):
+            continue
+        raw_bars = m.get("bars")
+        if raw_bars is None:
+            raw_bars = m.get("durationBars")
+        try:
+            bars = int(raw_bars) if raw_bars is not None else 2
+        except Exception:
+            bars = 2
+        bars = max(1, min(16, bars))
+
+        line_text_val = str(m.get("lineText") or m.get("line_text") or "").strip()
+        raw_idx = m.get("lineIndex")
+        if raw_idx is None:
+            # Bez indexu lze cíl určit jen podle JEDNOZNAČNÉHO textu –
+            # nikdy ne podle první textové shody.
+            if not line_text_val:
+                return _fail("Zarážka bez lineIndex i lineText – cíl nelze určit.")
+            matches = [i for i, (_p, kind, payload) in enumerate(clean)
+                       if song_parser.clean_line_text(kind, payload) == line_text_val]
+            if len(matches) != 1:
+                return _fail(
+                    f"Zarážka bez lineIndex: text {line_text_val!r} není v textu "
+                    f"jednoznačný ({len(matches)} shod) – cíl nelze určit."
+                )
+            idx = matches[0]
+        else:
             try:
-                idx = int(idx)
-                if 0 <= idx < len(ordered_now):
-                    result = song_parser.insert_stop_directive(result, idx, bars)
-                    continue
+                idx = int(raw_idx)
             except Exception:
-                pass
-        # fallback podle lineText
-        if line_text:
-            for oi, ln in enumerate(ordered_now):
-                if song_parser.line_text(ln) == line_text:
-                    result = song_parser.insert_stop_directive(result, oi, bars)
-                    break
+                return _fail(f"Zarážka s neplatným lineIndex {raw_idx!r}.")
+        prepared.append((idx, bars, line_text_val or None))
+
+    if not prepared:
+        return cleaned
+
+    # 3) Vložit sestupně podle cílového indexu (nižší indexy se neposunou).
+    # lineText slouží jen jako kontrola cílového řádku, ne jako způsob výběru.
+    result = cleaned
+    for idx, bars, expected in sorted(prepared, key=lambda t: t[0], reverse=True):
+        try:
+            result = song_parser.insert_stop_directive(
+                result, idx, bars, expected_line_text=expected,
+            )
+        except ValueError as e:
+            return _fail(str(e))
     return result

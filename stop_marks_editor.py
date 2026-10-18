@@ -17,7 +17,7 @@ class StopMarksDialog(QDialog):
         self.entry = entry  # dict s content, stopMarks
         self.setWindowTitle(f"Zarážky – {entry.get('artist')} – {entry.get('title')}")
         self.setMinimumSize(700, 500)
-        self._ordered_cache = []
+        self._clean_cache = []  # čisté ordered řádky (bez stop direktiv) – indexový prostor lineIndex
         self._init_ui()
         self._refresh()
 
@@ -131,27 +131,31 @@ class StopMarksDialog(QDialog):
         content = self.entry.get("content") or ""
         marks: list[dict] = list(self.entry.get("stopMarks") or [])
         ordered = song_parser.ordered_lines(content)
-        self._ordered_cache = ordered
+        # Čistý indexový prostor: řádky BEZ stop direktiv = zdroj lineIndex zarážek.
+        clean_lines = [ln for ln in ordered
+                       if not any(e.type == song_parser.ElementType.stopMark for e in ln)]
+        self._clean_cache = clean_lines
 
-        # Naplnit řádky (číslované, s označením kde už je pauza)
+        # Naplnit řádky (číslované čistým pořadím, s označením kde už je pauza)
         self.lines_list.clear()
         mark_indices = {m.get("lineIndex") for m in marks if m.get("lineIndex") is not None}
-        # také podle lineText
-        mark_texts = {m.get("lineText", "").strip() for m in marks}
-        for idx, ln in enumerate(ordered):
+        clean_idx = 0
+        for ln in ordered:
             is_stop = any(e.type == song_parser.ElementType.stopMark for e in ln)
-            txt = song_parser.line_text(ln)
             if is_stop:
-                label = f"{idx+1}. [Pauza {next((e.stop_mark_bars for e in ln if e.type == song_parser.ElementType.stopMark), 2)} taktů]"
-            else:
-                label = f"{idx+1}. {txt[:80]}"
-                if idx in mark_indices or txt in mark_texts:
-                    label += "  ← zarážka před tímto řádkem"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, idx)
-            if is_stop:
-                # odlišit vizuálně, ale pro NVDA hlavně text
+                # Pauza se zobrazí pro přehled, ale nejde vybrat jako cíl další zarážky.
+                bars = next((e.stop_mark_bars for e in ln if e.type == song_parser.ElementType.stopMark), 2)
+                item = QListWidgetItem(f"    [Pauza {bars} taktů]")
+                item.setData(Qt.ItemDataRole.UserRole, None)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            else:
+                txt = song_parser.line_text(ln)
+                label = f"{clean_idx+1}. {txt[:80]}"
+                if clean_idx in mark_indices:
+                    label += "  ← zarážka před tímto řádkem"
+                item = QListWidgetItem(label)
+                item.setData(Qt.ItemDataRole.UserRole, clean_idx)
+                clean_idx += 1
             self.lines_list.addItem(item)
 
         # Naplnit zarážky
@@ -178,16 +182,20 @@ class StopMarksDialog(QDialog):
             QMessageBox.warning(self, "Varování", "Vyberte řádek, před který se má vložit zarážka.")
             return
         idx = self.lines_list.currentItem().data(Qt.ItemDataRole.UserRole)
-        # nedovolit přidat před samotnou direktivu
-        ordered = self._ordered_cache
-        if 0 <= idx < len(ordered) and any(e.type == song_parser.ElementType.stopMark for e in ordered[idx]):
+        if idx is None:
+            # řádek pauzy (directivy) není platný cíl
             QMessageBox.warning(self, "Varování", "Před pauzu nelze vložit další pauzu. Vyberte textový řádek.")
             return
+        clean_lines = self._clean_cache
+        if not (0 <= idx < len(clean_lines)):
+            QMessageBox.warning(self, "Varování", "Vybraný řádek není platný cíl zarážky.")
+            return
+        line_text = song_parser.line_text(clean_lines[idx])
         bars = int(self.bars_spin.value())
-        line_text = song_parser.line_text(ordered[idx]) if 0 <= idx < len(ordered) else ""
-        # zkontrolovat duplicitu
+        # Duplicita = stejný cílový řádek (lineIndex). Text se k rozlišení
+        # opakovaných řádků nepoužívá – dva různé řádky se stejným textem jsou různé cíle.
         for m in (self.entry.get("stopMarks") or []):
-            if m.get("lineIndex") == idx or (line_text and m.get("lineText") == line_text):
+            if m.get("lineIndex") == idx:
                 QMessageBox.warning(self, "Varování", "Před tímto řádkem už zarážka existuje. Nejprve ji odeberte.")
                 return
         new_mark = {"lineText": line_text, "lineIndex": int(idx), "bars": int(bars)}

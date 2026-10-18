@@ -110,96 +110,152 @@ def directive_for_bars(bars: int, use_pause: bool = False) -> str:
     return f"{{{tag}:{int(bars)}}}"
 
 
-def insert_stop_directive(content: str, target_line_index: int, bars: int, use_pause: bool = False) -> str:
+# --- Fyzická mapa řádků – jednotný indexový prostor pro zarážky ---
+#
+# lineIndex zarážky = index CÍLOVÉHO řádku v prostoru textu BEZ stop direktiv
+# {stop:N}/{pause:N}. Takto se zarážky načítají, zobrazují i vkládají.
+# Direktivy se do ordered_lines() započítávají jako řádky, proto je jejich
+# přítomnost v textu nesmí posouvat cílové indexy žádné další operace.
+
+# Druhy fyzických řádků (konzistentní s parse()):
+#   'empty'   – prázdný řádek (nevstupuje do ordered_lines)
+#   'text'    – textový řádek (vstupuje do ordered_lines, je to čistý řádek)
+#   'comment' – direktiva {c:...} (vstupuje do ordered_lines, je to čistý řádek)
+#   'stop'    – direktiva {stop:N}/{pause:N} (vstupuje do ordered_lines, NENÍ čistý řádek)
+#   'section' – {soc}/{eoc} (nevstupuje do ordered_lines)
+#   'other'   – jiná direktiva (nevstupuje do ordered_lines)
+
+def split_physical_lines(content: str) -> list[tuple[int, str, str]]:
     """
-    Vloží direktivu {stop:N} před cílový logický řádek (podle ordered_lines).
-    Mapuje logický index na fyzický řádek v souboru (ignoruje prázdné/direktivy).
-    Pokud se nepodaří namapovat, vloží na konec.
+    Rozdělí content na fyzické řádky a určí jejich druh stejnou logikou jako parse().
+    Vrací seznam (fyzický_index, druh, zbytek_řádku).
     """
-    bars = max(1, min(16, int(bars)))
-    directive = directive_for_bars(bars, use_pause)
-    # Najít fyzický řádek odpovídající ordered_lines[target]
-    ordered = ordered_lines(content)
-    if not ordered or target_line_index < 0 or target_line_index >= len(ordered):
-        # fallback: na konec
-        suffix = "" if content.endswith("\n") else "\n"
-        return content + suffix + directive + "\n"
-    target_text = line_text(ordered[target_line_index])
-    # Projít raw řádky a najít ten, jehož parse odpovídá target_text
-    raw_lines = file_lines_raw(content)
-    # Sestavíme mapu: fyzický index -> ordered index (jen neprázdné nedirektivní)
-    ordered_ptr = 0
-    for phys_idx, raw in enumerate(raw_lines):
+    out: list[tuple[int, str, str]] = []
+    for i, raw in enumerate(file_lines_raw(content or "")):
         stripped = raw.strip()
         if not stripped:
+            out.append((i, "empty", stripped))
             continue
         if stripped.startswith("{") and stripped.endswith("}"):
-            # direktiva – odpovídá ordered linii typu stopMark/comment/soc, ale my hledáme textovou linii
-            # Zjistíme, zda ordered[ordered_ptr] je direktivní linie
-            if ordered_ptr < len(ordered):
-                # pokud je to direktivní linie, posun ordered_ptr a pokračuj
-                has_directive = any(e.type in (ElementType.stopMark, ElementType.comment) for e in ordered[ordered_ptr])
-                if has_directive:
-                    if ordered_ptr == target_line_index:
-                        # cíl je samotná direktiva – vložit před ni
-                        raw_lines.insert(phys_idx, directive)
-                        return "\n".join(raw_lines)
-                    ordered_ptr += 1
-                    continue
+            directive = stripped[1:-1].strip()
+            if directive.startswith("soc") or directive.startswith("chorus") or directive.startswith("eoc"):
+                out.append((i, "section", directive))
+            elif directive.startswith("c:"):
+                out.append((i, "comment", directive))
+            elif directive.startswith("stop:") or directive.startswith("pause:"):
+                out.append((i, "stop", directive))
+            else:
+                out.append((i, "other", directive))
             continue
-        # textová linie
-        if ordered_ptr < len(ordered) and line_text(ordered[ordered_ptr]) == stripped or line_text(ordered[ordered_ptr]) == line_text(_parse_line(stripped)):
-            if ordered_ptr == target_line_index:
-                raw_lines.insert(phys_idx, directive)
-                return "\n".join(raw_lines)
-            ordered_ptr += 1
-        else:
-            # fallback tolerace: porovnáme normalized
-            if ordered_ptr < len(ordered) and line_text(ordered[ordered_ptr]) == target_text and ordered_ptr == target_line_index:
-                raw_lines.insert(phys_idx, directive)
-                return "\n".join(raw_lines)
-            if ordered_ptr < len(ordered):
-                ordered_ptr += 1
-    # nenalezeno -> na konec
-    suffix = "" if content.endswith("\n") else "\n"
-    return content + suffix + directive + "\n"
+        out.append((i, "text", stripped))
+    return out
+
+
+def clean_line_text(kind: str, payload: str) -> str:
+    """Text čistého řádku ('text'/'comment') – shodný s line_text() nad ordered řádkem."""
+    if kind == "comment":
+        return payload[2:].strip()
+    return line_text(_parse_line(payload))
+
+
+def clean_line_indices(content: str) -> list[int]:
+    """Fyzické indexy čistých řádků (bez stop direktiv) v pořadí čistého indexového prostoru."""
+    return [p for (p, kind, _pay) in split_physical_lines(content) if kind in ("text", "comment")]
+
+
+def parse_directive_bars(directive: str) -> int:
+    """Počet taktů z 'stop:4'/'pause:4' (0 pokud chybí nebo není číslo)."""
+    parts = (directive or "").split(":", 1)
+    if len(parts) > 1:
+        try:
+            return int(parts[1].strip())
+        except Exception:
+            return 0
+    return 0
+
+
+def insert_stop_directive(
+    content: str,
+    target_line_index: int,
+    bars: int,
+    use_pause: bool = False,
+    expected_line_text: Optional[str] = None,
+) -> str:
+    """
+    Vloží direktivu {stop:N} před cílový řádek.
+
+    target_line_index je index CÍLOVÉHO řádku v prostoru BEZ stop direktiv
+    (tj. počítají se jen textové řádky a direktivy {c:...}); direktivy
+    {stop:N}/{pause:N} přítomné v textu index nijak neposouvají. Hodnota
+    index == počet čistých řádků znamená „za posledním řádkem textu“.
+
+    Pokud je expected_line_text neprázdný, ověří se, že cílový řádek má
+    tento text; při neshodě nebo neplatném indexu funkce vyhodí ValueError
+    a původní obsah zůstane beze změny (nikdy netichom nepřesouvá direktivu
+    na konec souboru).
+    """
+    try:
+        idx = int(target_line_index)
+    except (TypeError, ValueError):
+        raise ValueError(f"Neplatný lineIndex: {target_line_index!r} – očekáváváno celé číslo.")
+    try:
+        bars_int = int(bars)
+    except (TypeError, ValueError):
+        raise ValueError(f"Neplatný počet taktů: {bars!r}")
+    bars_int = max(1, min(16, bars_int))
+    directive = directive_for_bars(bars_int, use_pause)
+
+    clean = [(p, kind, payload) for (p, kind, payload) in split_physical_lines(content)
+             if kind in ("text", "comment")]
+    if idx < 0 or idx > len(clean):
+        raise ValueError(
+            f"lineIndex {idx} je mimo rozsah 0..{len(clean)} "
+            f"(počet řádků textu bez direktiv)."
+        )
+
+    if idx == len(clean):
+        # Za posledním čistým řádkem textu. Pokud ale zarážka udává neprázdný
+        # lineText, tvrdí, že existuje cílový řádek – ten za koncem textu není
+        # (typický příznak starých, „špinavých“ indexů). Raději chyba než
+        # tiché vložení na konec souboru.
+        if expected_line_text is not None and str(expected_line_text).strip():
+            raise ValueError(
+                f"lineIndex {idx} je za koncem textu, ale lineText "
+                f"{str(expected_line_text).strip()!r} udává cílový řádek – údaje si odporují."
+            )
+        insert_at = clean[-1][0] + 1 if clean else 0
+    else:
+        _p, kind, payload = clean[idx]
+        target_text = clean_line_text(kind, payload)
+        if expected_line_text is not None and str(expected_line_text).strip():
+            expected = str(expected_line_text).strip()
+            if expected != target_text:
+                raise ValueError(
+                    f"lineText nesouhlasí s řádkem {idx + 1}: "
+                    f"očekáváno {expected!r}, nalezeno {target_text!r}."
+                )
+        insert_at = clean[idx][0]
+
+    raw_lines = file_lines_raw(content)
+    raw_lines.insert(insert_at, directive)
+    return "\n".join(raw_lines)
 
 
 def remove_stop_directive_at(content: str, ordered_index: int) -> tuple[str, bool]:
     """
-    Odstraní direktivu {stop/pause} na daném ordered indexu. Vrací (nový obsah, odstraněno?).
+    Odstraní první stop direktivu, jejíž cílový řádek leží na daném indexu
+    v prostoru BEZ stop direktiv (stejný význam jako u insert_stop_directive).
+    Vrací (nový obsah, odstraněno?).
     """
-    ordered = ordered_lines(content)
-    if ordered_index < 0 or ordered_index >= len(ordered):
-        return content, False
-    # ověř, že na indexu je stopMark
-    if not any(e.type == ElementType.stopMark for e in ordered[ordered_index]):
-        return content, False
-    raw_lines = file_lines_raw(content)
-    ordered_ptr = 0
-    for phys_idx, raw in enumerate(raw_lines):
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("{") and stripped.endswith("}"):
-            directive = stripped[1:-1].strip()
-            is_stop = directive.startswith("stop:") or directive.startswith("pause:")
-            if is_stop and ordered_ptr < len(ordered) and any(e.type == ElementType.stopMark for e in ordered[ordered_ptr]):
-                if ordered_ptr == ordered_index:
-                    del raw_lines[phys_idx]
-                    return "\n".join(raw_lines), True
-                ordered_ptr += 1
-            elif any(e.type in (ElementType.comment,) for e in ordered[ordered_ptr]) if ordered_ptr < len(ordered) else False:
-                ordered_ptr += 1
-            continue
-        # textová linie – posun
-        if ordered_ptr < len(ordered) and not any(e.type == ElementType.stopMark for e in ordered[ordered_ptr]):
-            if ordered_ptr == ordered_index:
-                # nemělo nastat – target je stop, ale tady je text
-                pass
-            ordered_ptr += 1
-        elif ordered_ptr < len(ordered):
-            ordered_ptr += 1
+    clean_count = 0
+    for p, kind, _payload in split_physical_lines(content):
+        if kind == "stop":
+            if clean_count == ordered_index:
+                raw_lines = file_lines_raw(content)
+                del raw_lines[p]
+                return "\n".join(raw_lines), True
+        elif kind in ("text", "comment"):
+            clean_count += 1
     return content, False
 
 
