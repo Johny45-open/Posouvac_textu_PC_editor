@@ -51,6 +51,8 @@ PERSIST_KEYS = {
     "diacriticAutoPreview": "diacritic/autoPreview",
     "setlistName": "setlist/name",
     "setlistJson": "setlist/json",
+    "setlistUid": "setlist/uid",
+    "setlistExtras": "setlist/extras",
 }
 DEFAULT_MAX_HISTORY = 5
 
@@ -672,6 +674,11 @@ class PCEditorApp(QMainWindow):
         self.library_file_map: dict[str, dict] = {}
         self.csv_library: list[dict] = []
         self.setlist: list[dict] = []
+        # Přenosová identita aktuálního setlistu (JSON v5, etapa A1.1).
+        # Generuje se při vzniku setlistu, ne při exportu; při importu se
+        # případně převezme ze souboru (viz import_from_generator).
+        self.setlist_uid: str = playlist_backend.new_playlist_uid()
+        self.setlist_extras: dict = {}
         self.current_library_index: int = -1
         self.output_folder: str = ""
         self.source_folder: str = ""
@@ -837,6 +844,13 @@ class PCEditorApp(QMainWindow):
         try:
             name = self.setlist_name_input.text().strip() if hasattr(self, 'setlist_name_input') else ""
             self.settings.setValue(PERSIST_KEYS["setlistName"], name)
+            # přenosová identita setlistu a neznámá pole (JSON v5, A1.1)
+            try:
+                self.settings.setValue(PERSIST_KEYS["setlistUid"], str(self.setlist_uid or ""))
+                self.settings.setValue(PERSIST_KEYS["setlistExtras"],
+                                       json.dumps(self.setlist_extras or {}, ensure_ascii=False))
+            except Exception:
+                pass
             # serializovat setlist – pro úsporu bez content pokud velký
             try:
                 payload = json.dumps(self.setlist, ensure_ascii=False)
@@ -851,7 +865,13 @@ class PCEditorApp(QMainWindow):
             try:
                 af = self._get_autosave_file()
                 if af:
-                    data = {"name": name, "songs": self.setlist, "savedAt": __import__("datetime").datetime.now().isoformat()}
+                    data = {
+                        "name": name,
+                        "uid": self.setlist_uid or "",
+                        "extras": self.setlist_extras or {},
+                        "songs": self.setlist,
+                        "savedAt": __import__("datetime").datetime.now().isoformat(),
+                    }
                     # atomicky
                     tmp = af + ".tmp"
                     with open(tmp, 'w', encoding='utf-8') as f:
@@ -1009,21 +1029,40 @@ class PCEditorApp(QMainWindow):
             if self._remember(PERSIST_KEYS["rememberSetlist"]):
                 sj = str(self.settings.value(PERSIST_KEYS["setlistJson"], "") or "").strip()
                 sname = str(self.settings.value(PERSIST_KEYS["setlistName"], "") or "").strip()
-                # fallback soubor
-                if not sj:
+                # přenosová identita a neznámá pole (JSON v5, A1.1)
+                uid = str(self.settings.value(PERSIST_KEYS["setlistUid"], "") or "").strip()
+                extras_raw = str(self.settings.value(PERSIST_KEYS["setlistExtras"], "") or "").strip()
+                # fallback soubor (autosave) – čte se pro songs, název, uid i extras
+                if not sj or not uid:
                     af = self._get_autosave_file()
                     if af and os.path.exists(af):
                         try:
                             with open(af, 'r', encoding='utf-8') as f:
                                 jd = json.load(f)
+                            if not sj and isinstance(jd, dict):
                                 sj = json.dumps(jd.get("songs") or [], ensure_ascii=False)
                                 sname = str(jd.get("name") or sname)
+                            if not uid and isinstance(jd, dict):
+                                uid = str(jd.get("uid") or "").strip()
+                            if not extras_raw and isinstance(jd, dict) and isinstance(jd.get("extras"), dict):
+                                extras_raw = json.dumps(jd["extras"], ensure_ascii=False)
                         except Exception:
                             pass
+                if uid:
+                    self.setlist_uid = uid
+                if extras_raw:
+                    try:
+                        ex = json.loads(extras_raw)
+                        if isinstance(ex, dict):
+                            self.setlist_extras = ex
+                    except Exception:
+                        pass
                 if sj:
                     try:
                         arr = json.loads(sj)
                         if isinstance(arr, list):
+                            # staré autosave bez ID: occurrenceId doplnit jednou (A1.1)
+                            playlist_backend.ensure_song_ids(arr)
                             self.setlist = arr
                             if sname:
                                 try:
@@ -1998,12 +2037,27 @@ class PCEditorApp(QMainWindow):
         
         raw_songs = data.get("_normSongs") or data.get("songs") or []
         enriched, missing = library_model.enrich_imported_songs(raw_songs, self.library)
-        
+        # occurrenceId: načtení doplnilo chybějící ID, obohacení je muselo
+        # zachovat; pojistka proti kolizím po případném sloučení (A1.1)
+        playlist_backend.ensure_song_ids(enriched)
+        # nahrazující import vytváří nový setlist; zařaďující import (merge)
+        # si ponechává identitu stávajícího setlistu
+        replacing = (not self.merge_check.isChecked()) or not self.setlist
+
         if self.merge_check.isChecked():
             self.setlist.extend(enriched)
+            playlist_backend.ensure_song_ids(self.setlist)
         else:
             self.setlist = enriched
             self.setlist_name_input.setText(data.get("name") or Path(fn).stem)
+
+        if replacing:
+            # přenosová identita setlistu: ze souboru (v5), jinak nově vygenerovaná.
+            # Nikdy se nepáruje podle názvu (pravidlo A1.1).
+            file_uid = str(data.get("playlistUid") or "").strip()
+            self.setlist_uid = file_uid or playlist_backend.new_playlist_uid()
+            top_extras = data.get("_extras")
+            self.setlist_extras = dict(top_extras) if isinstance(top_extras, dict) else {}
         
         # per-setlist TTS meta: nabídnout přepnutí hlasu dle importovaného souboru
         try:
@@ -2466,6 +2520,9 @@ class PCEditorApp(QMainWindow):
             "content": entry.get("content"),
             "stopMarks": list(entry.get("stopMarks") or []),
             "filePath": entry.get("filePath"),
+            # nový výskyt = nové přenosové ID; stejná píseň přidána znovu
+            # dostane vždy jiné occurrenceId (A1.1)
+            "occurrenceId": playlist_backend.new_occurrence_id(),
         }
         self.setlist.append(copy)
         self.refresh_setlist()
@@ -2577,6 +2634,33 @@ class PCEditorApp(QMainWindow):
             return False
         return True
 
+    def _confirm_legacy_export(self) -> bool:
+        """Upozorní před exportem, pokud setlist obsahuje opakované skladby
+        nebo nastavení specifické pro výskyty (JSON v5, etapa A1.1).
+
+        Starší verze telefonní aplikace číslo verze nekontrolují a opakované
+        výskyty při importu tiše sloučí. Uživatel musí mít možnost export
+        přerušit. Vrací True = pokračovat.
+        """
+        try:
+            warnings = playlist_backend.legacy_export_warnings(self.setlist)
+        except Exception:
+            return True
+        if not warnings:
+            return True
+        text = "\n".join(f"• {w}" for w in warnings)
+        answer = QMessageBox.warning(
+            self,
+            "Upozornění pro starší aplikace",
+            text + "\n\n"
+            "Starší verze aplikace Posouvač textu neznají identifikátory výskytů "
+            "(JSON v5) a tato data mohou při importu a následném exportu ztratit.\n\n"
+            "Pokračovat v exportu?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _ensure_output_folder(self) -> str | None:
         if self.output_folder and os.path.isdir(self.output_folder):
             return self.output_folder
@@ -2625,6 +2709,9 @@ class PCEditorApp(QMainWindow):
     def save_all(self):
         if not self._require_setlist():
             return
+        if not self._confirm_legacy_export():
+            self.announce("Export přerušen uživatelem.")
+            return
         folder = self._ensure_output_folder()
         if not folder:
             return
@@ -2669,7 +2756,9 @@ class PCEditorApp(QMainWindow):
         except Exception:
             _tts_eng = None
             _tts_voice = None
-        success, result = playlist_backend.save_playlist_to(json_path, name, export_songs, tts_engine=_tts_eng, tts_voice=_tts_voice)
+        success, result = playlist_backend.save_playlist_to(
+            json_path, name, export_songs, tts_engine=_tts_eng, tts_voice=_tts_voice,
+            playlist_uid=self.setlist_uid, top_extras=self.setlist_extras)
         if not success:
             QMessageBox.critical(self, "Chyba", f"JSON se nepodařilo uložit: {result}")
             return
@@ -2714,6 +2803,9 @@ class PCEditorApp(QMainWindow):
     def save_playlist_json(self):
         if not self._require_setlist():
             return
+        if not self._confirm_legacy_export():
+            self.announce("Export přerušen uživatelem.")
+            return
         name = self.setlist_name_input.text().strip()
         folder = self._ensure_output_folder()
         if not folder:
@@ -2737,7 +2829,9 @@ class PCEditorApp(QMainWindow):
         except Exception:
             _tts_eng = None
             _tts_voice = None
-        success, result = playlist_backend.save_playlist_to(json_path, name, export_songs, tts_engine=_tts_eng, tts_voice=_tts_voice)
+        success, result = playlist_backend.save_playlist_to(
+            json_path, name, export_songs, tts_engine=_tts_eng, tts_voice=_tts_voice,
+            playlist_uid=self.setlist_uid, top_extras=self.setlist_extras)
         if success:
             QMessageBox.information(self, "Uloženo", f"Setlist uložen do:\n{result}\n\nZkopírujte přes USB.")
             self.announce(f"Setlist uložen: {result}")
@@ -2860,10 +2954,14 @@ class PCEditorApp(QMainWindow):
     def show_qr(self):
         if not self._require_setlist():
             return
+        if not self._confirm_legacy_export():
+            self.announce("Export QR přerušen uživatelem.")
+            return
         name = self.setlist_name_input.text().strip()
-        payload, err = playlist_backend.get_qr_payload(name, self.setlist)
+        payload, err = playlist_backend.get_qr_payload(
+            name, self.setlist, playlist_uid=self.setlist_uid, top_extras=self.setlist_extras)
         if err:
-            QMessageBox.warning(self, "QR příliš velký", f"{err}\n\nPoužijte soubor JSON.")
+            QMessageBox.warning(self, "QR přenos není možný", f"{err}")
             return
         if not HAS_QRCODE:
             QMessageBox.warning(self, "Chybí qrcode", "Nainstalujte pip install qrcode[pil].")
@@ -2875,6 +2973,9 @@ class PCEditorApp(QMainWindow):
     def copy_to_clipboard(self):
         if not self._require_setlist():
             return
+        if not self._confirm_legacy_export():
+            self.announce("Export do schránky přerušen uživatelem.")
+            return
         name = self.setlist_name_input.text().strip()
         try:
             _tts_eng = tts.get_engine()
@@ -2882,7 +2983,9 @@ class PCEditorApp(QMainWindow):
         except Exception:
             _tts_eng = None
             _tts_voice = None
-        text = playlist_backend.playlist_to_text(name, self.setlist, tts_engine=_tts_eng, tts_voice=_tts_voice)
+        text = playlist_backend.playlist_to_text(
+            name, self.setlist, tts_engine=_tts_eng, tts_voice=_tts_voice,
+            playlist_uid=self.setlist_uid, top_extras=self.setlist_extras)
         if not text:
             QMessageBox.critical(self, "Chyba", "Nepodařilo se sestavit JSON.")
             return

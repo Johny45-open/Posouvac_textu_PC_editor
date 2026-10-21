@@ -3,9 +3,31 @@ import re
 import csv
 import io
 import html
+import uuid
 from datetime import datetime, timezone
 
 MAX_QR_LENGTH = 1500
+
+# --- Identita setlistu a výskytů (JSON v5, etapa A1.1) ---
+# Verze zapisovaná novými klienty. Čtení v3/v4 zůstává zachováno – parser
+# číslo verze nekontroluje, čte klíče opportunisticky (stejně jako telefon).
+PLAYLIST_JSON_VERSION = 5
+
+# Kanonická pole horní úrovně JSON (kontrakt v5).
+TOP_LEVEL_KNOWN_FIELDS = {
+    "type", "version", "name", "exportedAt", "totalDuration", "unknownCount",
+    "songs", "ttsEngine", "ttsVoice", "playlistUid",
+}
+# Interní klíče načítací vrstvy – nikdy se neexportují jako data souboru.
+TOP_LEVEL_INTERNAL_FIELDS = {"_normSongs", "_extras"}
+
+# Kanonická pole položky setlistu. Cokoli jiného patří do "extras"
+# a musí se při exportu zachovat (rozhodnutí č. 6 schválení A1.1).
+SONG_KNOWN_FIELDS = {
+    "title", "name", "artist", "duration", "tempo", "content",
+    "stopMarks", "stop_marks", "filePath", "occurrenceId",
+    "scrollSpeed", "fontSize", "introDuration", "stopMarksOverride", "extras",
+}
 
 # Port lib/main.dart:70 parseImportedFileName – Interpret - Název
 _SEPARATOR_RE = re.compile(r'\s+[-–—]\s+')
@@ -92,6 +114,137 @@ def parse_tempo(raw: str):
     return None
 
 
+def new_playlist_uid() -> str:
+    """Nové přenosové ID setlistu (UUIDv4). Generuje se při vzniku setlistu,
+    nikdy při každém exportu."""
+    return str(uuid.uuid4())
+
+
+def new_occurrence_id() -> str:
+    """Nové přenosové ID výskytu písně (UUIDv4). Generuje se při vzniku výskytu
+    (přidání do setlistu, kopie), nikdy při exportu ani při přesunu/úpravě."""
+    return str(uuid.uuid4())
+
+
+def _valid_uid(value) -> str | None:
+    """Neprůhledný přenosový identifikátor musí být neprázdný řetězec."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def ensure_song_ids(songs: list) -> list:
+    """Doplní chybějící occurrenceId a ošetří kolize uvnitř seznamu (in-place).
+
+    - Staré soubory bez ID: doplní se jednou a zůstanou uložené v položce,
+      takže při dalším uložení přežijí (pravidlo schválení A1.1).
+    - Kolize dvou stejných ID v jednom seznamu = nebezpečí sloučení cizích
+      položek při importu → druhý výskyt dostane ID nové.
+    - Položky, které nejsou dict, se nechají být (řetězce normalizuje jinde).
+    Nikdy se nepřepočítává ID, které je v seznamu jediné a platné.
+    """
+    seen: set[str] = set()
+    for item in songs or []:
+        if not isinstance(item, dict):
+            continue
+        uid = _valid_uid(item.get("occurrenceId"))
+        if uid is None or uid in seen:
+            uid = new_occurrence_id()
+            item["occurrenceId"] = uid
+        seen.add(uid)
+    return songs
+
+
+def clone_songs(songs: list) -> list:
+    """Hluboká kopie položek setlistu s NOVÝMI occurrenceId.
+    Kopie setlistu nesmí sdílet identitu s originálem."""
+    out = []
+    for item in songs or []:
+        if isinstance(item, dict):
+            copy = json.loads(json.dumps(item, ensure_ascii=False))
+            copy["occurrenceId"] = new_occurrence_id()
+            out.append(copy)
+        else:
+            out.append(item)
+    return out
+
+
+def clone_setlist(songs: list) -> tuple[str, list]:
+    """Vytvoří kopii setlistu: (nové playlistUid, položky s novými occurrenceId)."""
+    return new_playlist_uid(), clone_songs(songs)
+
+
+def _field_signature(value) -> str:
+    """Porovnávací otisk hodnoty pole (pro zjištění odlišného nastavení výskytů)."""
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return str(value)
+
+
+def legacy_export_warnings(songs: list) -> list[str]:
+    """Varování před exportem pro starší aplikace (neznají occurrenceId / JSON v5).
+
+    Starší telefonní aplikace vkládají položky přes INSERT OR IGNORE nad
+    kompozitním klíčem (playlistId, songId) – opakovanou skladbu tiše sloučí
+    a přijdou tak o její odlišné nastavení (tempo, zarážky atd.).
+    """
+    def norm(s): return re.sub(r'\s+', ' ', (s or "").strip().lower())
+    groups: dict[str, list[dict]] = {}
+    for s in songs or []:
+        if not isinstance(s, dict):
+            continue
+        key = f"{norm(s.get('artist'))}|{norm(s.get('title'))}"
+        groups.setdefault(key, []).append(s)
+    warnings: list[str] = []
+    sig_fields = ("tempo", "duration", "scrollSpeed", "introDuration",
+                  "stopMarks", "stopMarksOverride")
+    for key, items in groups.items():
+        if len(items) < 2 or not key.strip("|"):
+            continue
+        label = f"{items[0].get('artist')} – {items[0].get('title')}"
+        distinct = any(
+            _field_signature(items[0].get(f)) != _field_signature(other.get(f))
+            for other in items[1:]
+            for f in sig_fields
+        )
+        if distinct:
+            warnings.append(
+                f"„{label}“ je v setlistu {len(items)}× s odlišným nastavením – "
+                f"starší aplikace výskyty sloučí a odlišné nastavení ztratí."
+            )
+        else:
+            warnings.append(
+                f"„{label}“ je v setlistu {len(items)}× – starší aplikace "
+                f"zobrazí jen jeden výskyt."
+            )
+    return warnings
+
+
+def _preserve_number(value):
+    """Zachová hodnotu nastavení (scrollSpeed/fontSize/introDuration).
+
+    Číselný řetězec se převede na float, číslo zůstane číslem a cokoli jiného
+    se ponechá doslova – pole se NESMÍ ztratit jen proto, že ho editor
+    zatím neumí zpracovat (rozhodnutí č. 7 schválení A1.1).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        s = value.strip().replace(",", ".")
+        if s:
+            try:
+                return float(s)
+            except ValueError:
+                return value
+        return None
+    return value
+
+
 def _normalize_song_entry(entry):
     """Normalizuje položku songs na dict {title,artist,duration,tempo,stopMarks,content,filePath} pro UI."""
     if isinstance(entry, dict):
@@ -134,10 +287,38 @@ def _normalize_song_entry(entry):
                 except Exception:
                     idx = None
                 stop_marks.append({"lineText": line_text, "lineIndex": idx, "bars": bars})
+        # --- Zachování identity a nastavení (etapa A1.1) ---
+        occurrence_id = _valid_uid(entry.get("occurrenceId"))
+        scroll_speed = _preserve_number(entry.get("scrollSpeed"))
+        font_size = _preserve_number(entry.get("fontSize"))
+        intro_duration = _preserve_number(entry.get("introDuration"))
+        stop_override = entry.get("stopMarksOverride")
+        # Neznámá pole → extras; kanonická (známá) pole mají vždy přednost,
+        # proto se ze extras odstraní (rozhodnutí č. 6 schválení A1.1).
+        extras: dict = {}
+        raw_extras = entry.get("extras")
+        if isinstance(raw_extras, dict):
+            extras.update(raw_extras)
+        for k, v in entry.items():
+            if k not in SONG_KNOWN_FIELDS:
+                extras[k] = v
+        extras = {k: v for k, v in extras.items() if k not in SONG_KNOWN_FIELDS}
         result = {"title": title, "artist": artist, "duration": dur, "tempo": tempo, "content": entry.get("content"), "stopMarks": stop_marks}
         # filePath pro PC editor (interní)
         if entry.get("filePath"):
             result["filePath"] = str(entry.get("filePath"))
+        if occurrence_id:
+            result["occurrenceId"] = occurrence_id
+        if scroll_speed is not None:
+            result["scrollSpeed"] = scroll_speed
+        if font_size is not None:
+            result["fontSize"] = font_size
+        if intro_duration is not None:
+            result["introDuration"] = intro_duration
+        if stop_override is not None:
+            result["stopMarksOverride"] = stop_override
+        if extras:
+            result["extras"] = extras
         return result
     else:
         raw = str(entry).strip()
@@ -149,9 +330,15 @@ def _normalize_song_entry(entry):
         return {"title": t, "artist": a, "duration": None, "tempo": None}
 
 
-def build_playlist_data(name, songs, tts_engine=None, tts_voice=None):
-    """Sestaví v3 playlist dict (zpětně kompatibilní s v2). songs = list[dict|str] toleruje obojí.
-       tts_engine/tts_voice se ukládá jako meta pro per-setlist preferenci hlasu (volitelné)."""
+def build_playlist_data(name, songs, tts_engine=None, tts_voice=None,
+                        playlist_uid=None, top_extras=None):
+    """Sestaví v5 playlist dict (zpětně kompatibilní s v2/v3/v4 při čtení).
+
+    tts_engine/tts_voice se ukládá jako meta pro per-setlist preferenci hlasu.
+    playlist_uid – přenosové ID setlistu (playlistUid); generuje se při vzniku
+    setlistu, sem se jen přenáší.
+    top_extras – neznámá pole z načteného souboru, která se mají zachovat.
+    Kanonická pole mají přednost, proto se extras přidávají až nakonec."""
     if not name or not (isinstance(name, str) and name.strip()):
         return None
     if not songs:
@@ -159,7 +346,6 @@ def build_playlist_data(name, songs, tts_engine=None, tts_voice=None):
     clean = []
     total = 0
     unknown = 0
-    has_marks = False
     for s in songs:
         norm = _normalize_song_entry(s)
         if norm is None or not norm.get("title"):
@@ -178,10 +364,9 @@ def build_playlist_data(name, songs, tts_engine=None, tts_voice=None):
             c = str(norm["content"]).strip()
             if c:
                 entry["content"] = c
-        # stopMarks – v3
+        # stopMarks – v3+ (lineIndex v čistém prostoru, B1)
         marks = norm.get("stopMarks") or []
         if marks:
-            has_marks = True
             entry["stopMarks"] = [{"lineText": m["lineText"], "lineIndex": m.get("lineIndex"), "bars": int(m["bars"])} for m in marks]
             # odstranit None lineIndex pro čistší JSON
             for mm in entry["stopMarks"]:
@@ -192,43 +377,68 @@ def build_playlist_data(name, songs, tts_engine=None, tts_voice=None):
             del entry["duration"]
         if "tempo" in entry and entry["tempo"] is None:
             del entry["tempo"]
+        # identita výskytu + nastavení, která editor jen zachovává (A1.1)
+        if norm.get("occurrenceId"):
+            entry["occurrenceId"] = norm["occurrenceId"]
+        for key in ("scrollSpeed", "fontSize", "introDuration"):
+            if norm.get(key) is not None:
+                entry[key] = norm[key]
+        if norm.get("stopMarksOverride") is not None:
+            entry["stopMarksOverride"] = norm["stopMarksOverride"]
+        # neznámá pole položky – až po kanonických, nesmí je přepsat
+        for k, v in (norm.get("extras") or {}).items():
+            if k not in entry and not str(k).startswith("_"):
+                entry[k] = v
         clean.append(entry)
     if not clean:
         return None
-    version = 3 if has_marks else 3  # vždy v3 pro PC editor (telefon umí v2 i v3)
     data = {
         "type": "playlist",
-        "version": version,
+        "version": PLAYLIST_JSON_VERSION,
         "name": name.strip(),
         "exportedAt": datetime.now(timezone.utc).isoformat(),
         "totalDuration": total,
         "unknownCount": unknown,
         "songs": clean,
     }
+    uid = _valid_uid(playlist_uid)
+    if uid:
+        data["playlistUid"] = uid
     # per-setlist TTS preference (obojí: QSettings + JSON)
     if tts_engine and str(tts_engine).strip().lower() in ("auto", "edge", "gtts"):
         data["ttsEngine"] = str(tts_engine).strip().lower()
         if tts_voice:
             data["ttsVoice"] = str(tts_voice).strip()
+    # neznámá pole horní úrovně – až úplně nakonec (kanonická pole vyhrávají)
+    if isinstance(top_extras, dict):
+        for k, v in top_extras.items():
+            if k not in data and not str(k).startswith("_"):
+                data[k] = v
     return data
 
 
-def playlist_to_text(name, songs, tts_engine=None, tts_voice=None):
-    data = build_playlist_data(name, songs, tts_engine=tts_engine, tts_voice=tts_voice)
+def playlist_to_text(name, songs, tts_engine=None, tts_voice=None,
+                     playlist_uid=None, top_extras=None):
+    data = build_playlist_data(name, songs, tts_engine=tts_engine, tts_voice=tts_voice,
+                               playlist_uid=playlist_uid, top_extras=top_extras)
     if data is None:
         return None
     return json.dumps(data, ensure_ascii=False, indent=2)
 
 
-def save_playlist(name, songs, tts_engine=None, tts_voice=None):
+def save_playlist(name, songs, tts_engine=None, tts_voice=None,
+                  playlist_uid=None, top_extras=None):
     filename = f"{name.strip().replace(' ', '_')}.json"
-    return save_playlist_to(filename, name, songs, tts_engine=tts_engine, tts_voice=tts_voice)
+    return save_playlist_to(filename, name, songs, tts_engine=tts_engine, tts_voice=tts_voice,
+                            playlist_uid=playlist_uid, top_extras=top_extras)
 
 
-def save_playlist_to(filename, name, songs, tts_engine=None, tts_voice=None):
+def save_playlist_to(filename, name, songs, tts_engine=None, tts_voice=None,
+                     playlist_uid=None, top_extras=None):
     if not name or not str(name).strip() or not songs:
         return False, "Název ani seznam písní nesmí být prázdný."
-    data = build_playlist_data(name, songs, tts_engine=tts_engine, tts_voice=tts_voice)
+    data = build_playlist_data(name, songs, tts_engine=tts_engine, tts_voice=tts_voice,
+                               playlist_uid=playlist_uid, top_extras=top_extras)
     if data is None:
         return False, "Nepodařilo se sestavit playlist (prázdné položky)."
     try:
@@ -243,16 +453,31 @@ def load_playlist(filename):
     try:
         with open(filename, 'r', encoding='utf-8-sig') as f:
             data = json.load(f)
-        # normalizovat na v2 pro UI – ale vrátit raw data pro zpětnou kompatibilitu
-        # sjednocení: zajistit songs jako list[dict]
+        # normalizovat pro UI – ale vrátit raw data pro zpětnou kompatibilitu
         if isinstance(data, dict) and "songs" in data:
+            # neznámá pole horní úrovně zachovat pro zpětný export (A1.1)
+            extras = {k: v for k, v in data.items()
+                      if k not in TOP_LEVEL_KNOWN_FIELDS and k not in TOP_LEVEL_INTERNAL_FIELDS}
+            if extras:
+                data["_extras"] = extras
+            raw_songs = data.get("songs")
+            if not isinstance(raw_songs, list):
+                raw_songs = []
             norm_songs = []
-            for s in data.get("songs") or []:
+            pairs: list[tuple] = []
+            for s in raw_songs:
                 n = _normalize_song_entry(s)
                 if n and n.get("title"):
                     norm_songs.append(n)
-            # vrátit obohacené data s norm_songs pod klíčem _normSongs, ale zachovat původní songs pro uložení
-            # pro GUI použijeme norm_songs
+                    pairs.append((s, n))
+            # Staré soubory bez ID: occurrenceId doplnit JEDNOU a zapsat zpět
+            # do položek, aby při dalším uložení přežila (pravidlo A1.1).
+            ensure_song_ids(norm_songs)
+            for s, n in pairs:
+                if isinstance(s, dict) and n.get("occurrenceId"):
+                    s["occurrenceId"] = n["occurrenceId"]
+            # vrátit obohacené data s norm_songs pod klíčem _normSongs,
+            # původní songs zůstávají pro uložení/zpětnou kompatibilitu
             data["_normSongs"] = norm_songs
         return True, data
     except Exception as e:
@@ -440,12 +665,18 @@ def save_library_docx(filename, title, songs, include_duration=True, include_tem
         return False, str(e)
 
 
-def get_qr_payload(name, songs):
-    """Vrátí JSON string pro QR (bez content/filePath) + délku. Pro QR se používá stejné v3."""
-    data = build_playlist_data(name, songs)
+def get_qr_payload(name, songs, playlist_uid=None, top_extras=None):
+    """Vrátí JSON string pro QR (bez content/filePath) + délku.
+
+    Formát je shodný s exportem JSON v5 – identita (playlistUid, occurrenceId),
+    nastavení i neznámá pole se do QR NEvynechávají. Vynechává se jen
+    `content` (záměrně, kvůli velikosti; telefon si text doplní z knihovny)
+    a interní `filePath` (které se do JSONu stejně neexportuje).
+    """
+    data = build_playlist_data(name, songs, playlist_uid=playlist_uid, top_extras=top_extras)
     if data is None:
         return None, "Prázdný playlist."
-    # očistit content/filePath pro QR (stopMarks ponechat – malá velikost, užitečné)
+    # očistit content pro QR (ostatní pole včetně ID a extras ponechat)
     clean_songs = []
     for s in data["songs"]:
         clean_songs.append({k: v for k, v in s.items() if k not in ("content", "filePath")})
@@ -453,7 +684,11 @@ def get_qr_payload(name, songs):
     payload = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
     # pretty pro schránku už dělá playlist_to_text; QR chce compact pro úsporu
     if len(payload) > MAX_QR_LENGTH:
-        return None, f"Setlist je příliš velký pro QR ({len(payload)} znaků, limit {MAX_QR_LENGTH}). Použijte soubor nebo HTML."
+        return None, (
+            f"Setlist se nevejde do QR kódu ({len(payload)} znaků, limit {MAX_QR_LENGTH}). "
+            f"Identifikační a nastavovací pole se do QR neskrývají – použijte "
+            f"export JSON (Ctrl+J) nebo USB přenos."
+        )
     return payload, None
 
 

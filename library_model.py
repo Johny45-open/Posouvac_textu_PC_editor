@@ -118,7 +118,7 @@ def enrich_imported_songs(imported: list[dict], library: list[dict]) -> tuple[li
         
         if match:
             # Obohatit
-            enriched.append({
+            merged = {
                 "title": imp.get("title"),
                 "artist": imp.get("artist"),
                 "duration": imp.get("duration") or match.get("duration"),
@@ -126,7 +126,20 @@ def enrich_imported_songs(imported: list[dict], library: list[dict]) -> tuple[li
                 "content": imp.get("content") or match.get("content"),
                 "stopMarks": imp.get("stopMarks") or match.get("stopMarks") or [],
                 "filePath": match.get("filePath")
-            })
+            }
+            # Zachovat identity a nastavení z importu (occurrenceId, scrollSpeed,
+            # fontSize, introDuration, stopMarksOverride i neznámá pole) –
+            # nesmí se ztratit při obohacení z knihovny (rozhodnutí 6+7 A1.1).
+            for k, v in imp.items():
+                if k not in merged and k != "extras":
+                    merged[k] = v
+            # extras: kanonická pole mají vždy přednost
+            imp_extras = imp.get("extras")
+            if isinstance(imp_extras, dict) and imp_extras:
+                extras = {k: v for k, v in imp_extras.items() if k not in merged}
+                if extras:
+                    merged["extras"] = extras
+            enriched.append(merged)
         else:
             missing.append(imp)
             # Přidat i tak, ale bez filePath/stopMarks
