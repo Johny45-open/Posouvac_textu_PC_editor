@@ -484,74 +484,112 @@ def load_playlist(filename):
         return False, str(e)
 
 
-# --- CSV knihovna (autocomplete) ---
+# --- CSV knihovna (doplňkové metadata) ---
 
-def _parse_csv_line(line: str):
-    """Respektuje čárky uvnitř uvozovek. Port lib/database.dart:371."""
-    # zkus csv modul s dialekty
-    for delim in [',', ';']:
+def _detect_delimiter(header_line: str) -> str:
+    """Zvolí jediný oddělovač pro celý soubor podle počtu výskytů v hlavičce
+       (pouze mimo uvozovky). Při stejné počtu rozhoduje čárka."""
+    best_delim, best_count = ',', -1
+    for delim in (',', ';'):
+        count = 0
+        in_quotes = False
+        for ch in (header_line or '').strip():
+            if ch == '"':
+                in_quotes = not in_quotes
+            elif not in_quotes and ch == delim:
+                count += 1
+        if count > best_count:
+            best_delim, best_count = delim, count
+    return best_delim
+
+
+def _read_csv_text(filename):
+    """Načte CSV jako text. Vrací (text, encoding) nebo (None, chyba).
+       Nejprve striktní utf-8-sig, pak cp1250 (běžné české Excel).
+       latin-1 se NEPOUŽÍVÁ – nikdy nesejde a potichu zkreslil by text."""
+    try:
+        with open(filename, 'rb') as f:
+            raw = f.read()
+    except Exception as e:
+        return None, f"Soubor se nepodařilo načíst: {e}"
+    if not raw:
+        return None, "Prázdný soubor."
+    for enc in ('utf-8-sig', 'cp1250'):
         try:
-            reader = csv.reader(io.StringIO(line), delimiter=delim, quotechar='"', doublequote=True, skipinitialspace=True)
-            parts = next(reader)
-            # heuristika: pokud je aspoň 2 sloupce a hlavička obsahuje artist/title/id, bereme
-            if len(parts) >= 2:
-                # rychlý test: pokud delim==',' a máme 5 sloupců nebo aspoň 2, vrať
-                # pokud delim==';' a čárková verze měla 1 sloupec, použij středník
-                # jednoduché: zkus čárku, pokud 1 sloupec a je tam středník, zkus středník
-                if delim == ',' and len(parts) == 1 and ';' in line:
-                    continue
-                return [p.strip().strip('"').strip() for p in parts]
-        except Exception:
+            return raw.decode(enc), enc
+        except UnicodeDecodeError:
             continue
-    # fallback split
-    return [p.strip().strip('"') for p in line.split(',')]
+    return None, "Nepodařilo se dekódovat soubor (neplatné utf-8 ani cp1250)."
 
 
 def load_csv_library(filename):
-    """Načte metadata_pisni.csv (id,artist,title,duration,filePath) pro autocomplete.
-       Vrací (True, list[dict]) nebo (False, err_str)."""
+    """Načte metadata_pisni.csv (id,artist,title,duration,filePath) pro
+       doplňování knihovny (duration/tempo).
+
+       Hlavička se rozpoznává bez ohledu na velikost písmen; pořadí sloupců
+       může být libovolné. Povinný je pouze sloupec `title`; `artist` a
+       `duration` jsou nepovinné – chybějící sloupec se chová jako prázdná
+       hodnota (nikdy se za něj nedosazuje jiný sloupec).
+
+       Vrací:
+         (True, list[dict], info)  – info: {imported, skipped, errors, encoding}
+         (False, error_str, {})    – struktura/čtení souboru, nic se nepoužije
+       """
+    text, enc_or_err = _read_csv_text(filename)
+    if text is None:
+        return False, enc_or_err, {}
+    # celosouborové parsití modulem csv – správně bere uvozovky, escapované
+    # uvozovky i řádkové zlomy uvnitř pole (newline'' bez překladu konců řádků)
+    first_line = text.splitlines()[0] if text else ''
+    delim = _detect_delimiter(first_line)
     try:
-        with open(filename, 'r', encoding='utf-8-sig') as f:
-            content = f.read()
-        lines = content.splitlines()
-        if not lines:
-            return False, "Prázdný soubor."
-        header = _parse_csv_line(lines[0])
-        # map indexů – case-insensitive
-        lower = [h.lower() for h in header]
-        try:
-            artist_idx = lower.index("artist")
-        except ValueError:
-            artist_idx = 1 if len(header) > 1 else -1
-        try:
-            title_idx = lower.index("title")
-        except ValueError:
-            title_idx = 2 if len(header) > 2 else -1
-        try:
-            dur_idx = lower.index("duration")
-        except ValueError:
-            dur_idx = 3 if len(header) > 3 else -1
-        result = []
-        for line in lines[1:]:
-            if not line.strip():
-                continue
-            parts = _parse_csv_line(line)
-            if len(parts) <= max(artist_idx, title_idx):
-                continue
-            artist = parts[artist_idx].strip() if artist_idx >= 0 and artist_idx < len(parts) else ""
-            title = parts[title_idx].strip() if title_idx >= 0 and title_idx < len(parts) else ""
-            if not title:
-                continue
-            dur_raw = parts[dur_idx].strip() if dur_idx >= 0 and dur_idx < len(parts) else ""
-            dur = parse_duration(dur_raw)
-            # když CSV dává sekundy jako "210" nebo "0"
-            if dur is None and dur_raw.isdigit():
-                v = int(dur_raw)
-                dur = v if v > 0 else None
-            result.append({"artist": artist, "title": title, "duration": dur, "label": f"{artist} - {title}" if artist else title})
-        return True, result
+        buf = io.StringIO(text, newline='')
+        rows = list(csv.reader(buf, delimiter=delim, quotechar='"',
+                               doublequote=True, skipinitialspace=True))
     except Exception as e:
-        return False, str(e)
+        # strukturní chyba – hranice záznamů nelze spolehlivě určit
+        return False, f"CSV nelze spolehlivě zpracovat: {e}", {}
+    if not rows:
+        return False, "Prázdný soubor.", {}
+    header = [h.strip().lower() for h in rows[0]]
+    if 'title' not in header:
+        return False, (
+            "CSV chybí povinný sloupec 'title' v hlavičce. "
+            "Očekává se hlavička obsahující title (a volitelně artist, duration)."
+        ), {}
+    title_col = header.index('title')
+    artist_col = header.index('artist') if 'artist' in header else None
+    duration_col = header.index('duration') if 'duration' in header else None
+
+    result = []
+    errors = []
+    skipped = 0
+    for line_no, row in enumerate(rows[1:], start=2):
+        if not row or all((c or '').strip() == '' for c in row):
+            skipped += 1
+            errors.append(f"řádek {line_no}: prázdný řádek")
+            continue
+        if title_col >= len(row):
+            skipped += 1
+            errors.append(f"řádek {line_no}: chybí sloupec title (méně hodnot než hlavička)")
+            continue
+        title = (row[title_col] or '').strip()
+        if not title:
+            skipped += 1
+            errors.append(f"řádek {line_no}: prázdné pole title")
+            continue
+        artist = (row[artist_col] or '').strip() if (artist_col is not None and artist_col < len(row)) else ''
+        dur_raw = (row[duration_col] or '').strip() if (duration_col is not None and duration_col < len(row)) else ''
+        dur = parse_duration(dur_raw)
+        # když CSV dává sekundy jako "210" nebo "0"
+        if dur is None and dur_raw.isdigit():
+            v = int(dur_raw)
+            dur = v if v > 0 else None
+        result.append({"artist": artist, "title": title, "duration": dur,
+                       "label": f"{artist} - {title}" if artist else title})
+    info = {"imported": len(result), "skipped": skipped,
+            "errors": errors, "encoding": enc_or_err}
+    return True, result, info
 
 
 # --- HTML export ---

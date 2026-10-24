@@ -968,7 +968,7 @@ class PCEditorApp(QMainWindow):
                         except Exception:
                             pass
                 if cp and os.path.exists(cp):
-                    ok, data = playlist_backend.load_csv_library(cp)
+                    ok, data, csv_info = playlist_backend.load_csv_library(cp)
                     if ok:
                         self.csv_library = data
                         if self.library:
@@ -977,7 +977,9 @@ class PCEditorApp(QMainWindow):
                                 self.refresh_library_list()
                             except Exception:
                                 pass
-                        restored.append(f"CSV {len(data)}")
+                        skipped = csv_info.get("skipped", 0)
+                        restored.append(f"CSV {csv_info.get('imported', len(data))}"
+                                       + (f" (+ {skipped} řádků zahozeno)" if skipped else ""))
                     else:
                         errors.append(f"CSV chyba: {data}")
                 elif cp:
@@ -1157,15 +1159,17 @@ class PCEditorApp(QMainWindow):
                     QMessageBox.warning(self, "Neexistuje", f"Složka neexistuje:\n{path}")
             elif kind == "csv":
                 if os.path.exists(path):
-                    ok, data = playlist_backend.load_csv_library(path)
+                    ok, data, csv_info = playlist_backend.load_csv_library(path)
                     if not ok:
-                        QMessageBox.critical(self, "Chyba", str(data))
+                        QMessageBox.critical(self, "Chyba", f"CSV se nepodařilo načíst: {data}")
                         return
                     self.csv_library = data
                     if self.library:
                         library_model.enrich_with_csv(self.library, self.csv_library)
                         self.refresh_library_list()
-                    self.announce(f"CSV načteno: {len(data)}")
+                    skipped = csv_info.get("skipped", 0)
+                    self.announce(f"CSV načteno: {csv_info.get('imported', len(data))} písní."
+                                 + (f" Přeskočeno {skipped} řádků." if skipped else ""))
                     self._save_csv_path(path)
                     self._rebuild_recent_menus()
                 else:
@@ -2085,7 +2089,7 @@ class PCEditorApp(QMainWindow):
         fn, _ = QFileDialog.getOpenFileName(self, "Načíst metadata_pisni.csv", "", "CSV (*.csv);;Vše (*)")
         if not fn:
             return
-        ok, data = playlist_backend.load_csv_library(fn)
+        ok, data, csv_info = playlist_backend.load_csv_library(fn)
         if not ok:
             QMessageBox.critical(self, "Chyba", f"CSV se nepodařilo načíst: {data}")
             return
@@ -2093,8 +2097,12 @@ class PCEditorApp(QMainWindow):
         if self.library:
             library_model.enrich_with_csv(self.library, self.csv_library)
             self.refresh_library_list()
-        self.announce(f"Knihovna načtena: {len(data)} písní.")
-        self.status_label.setText(f"CSV: {len(data)} písní. " + self.status_label.text())
+        n = csv_info.get("imported", len(data))
+        skipped = csv_info.get("skipped", 0)
+        suffix = f" Přeskočeno {skipped} řádků: " + "; ".join(csv_info.get("errors", [])[:3]) + "." if skipped else ""
+        self.announce(f"Knihovna načtena: {n} písní.{suffix}")
+        self.status_label.setText(f"CSV: {n} písní. " + (f"Přeskočeno {skipped} řádků. " if skipped else "")
+                                 + self.status_label.text())
         try:
             self._save_csv_path(fn)
             self._rebuild_recent_menus()

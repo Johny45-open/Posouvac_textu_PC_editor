@@ -72,28 +72,96 @@ def load_library_from_folder(folder: str) -> tuple[bool, list[dict] | str]:
 
 
 def enrich_with_csv(entries: list[dict], csv_entries: list[dict]) -> None:
-    """Doplní duration podle CSV (match artist+title). Modifikuje in-place."""
-    def norm(s): return re.sub(r'\s+', ' ', (s or "").strip().lower())
-    csv_by_title = {}
-    csv_by_full = {}
+    """Doplní chybějící duration/tempo knihovny podle CSV. Modifikuje in-place.
+
+    Základní zásada: CSV je zdroj doplňkových metadat – NIKDY nepřepíše ani
+    nesmaže již vyplněné hodnoty knihovny (prázdné pole v CSV není mazání).
+
+    Pravidla párování (konzervativní – raději nepřiložit, než přiřadit chybně):
+      1. Priorita je jednoznačná shoda normalizovaného artist+title
+         (velikost písmen a mezery se ignorují).
+      2. Řádek CSV bez interpreta se matchuje podle názvu pouze tehdy,
+         když je ten název v knihovně jednoznačný (1 skladba).
+      3. Řádek CSV s interpretem se NERAZÍ s knihovnou skladbou
+         se stejným názvem, ale s jiným známým interpretem.
+      4. Druhá úroveň: shoda ignorující diakritiku – pouze když je v knihovně
+         jednoznačná (bez kolize); kolize znamená žádné přiřazení.
+    """
+    def norm(s):
+        return re.sub(r'\s+', ' ', (s or "").strip().lower())
+
+    def norm_na(s):
+        return re.sub(r'\s+', ' ', diacritic_mod.strip_diacritics(s or "").strip().lower())
+
+    # CSV: index řádků podle normalizovaného title (přesného a bez diacritiky)
+    by_title: dict[str, list[dict]] = {}
+    by_title_na: dict[str, list[dict]] = {}
     for c in csv_entries:
         t = norm(c.get("title"))
+        if not t:
+            continue
         a = norm(c.get("artist"))
-        full = f"{a}|{t}"
-        if t and t not in csv_by_title:
-            csv_by_title[t] = c
-        if full and full not in csv_by_full:
-            csv_by_full[full] = c
+        rec = {"t": t, "a": a, "a_na": norm_na(c.get("artist")), "src": c}
+        by_title.setdefault(t, []).append(rec)
+        tna = norm_na(c.get("title"))
+        if tna:
+            by_title_na.setdefault(tna, []).append(rec)
+
+    # knihovna: počty skladeb se stejným (i bez diacritiky stejným) názvem
+    lib_title_counts: dict[str, int] = {}
+    lib_title_na_counts: dict[str, int] = {}
+    specs = []
     for e in entries:
         t = norm(e.get("title"))
+        tna = norm_na(e.get("title")) if t else ""
         a = norm(e.get("artist"))
-        full = f"{a}|{t}"
-        src = csv_by_full.get(full) or csv_by_title.get(t)
-        if src and src.get("duration"):
-            if not e.get("duration"):
-                e["duration"] = src["duration"]
-            if src.get("tempo") and not e.get("tempo"):
-                e["tempo"] = src.get("tempo")
+        a_na = norm_na(e.get("artist"))
+        specs.append((e, t, tna, a, a_na))
+        if t:
+            lib_title_counts[t] = lib_title_counts.get(t, 0) + 1
+        if tna:
+            lib_title_na_counts[tna] = lib_title_na_counts.get(tna, 0) + 1
+
+    def pick(cands: list[dict]):
+        """První kandidát s použitelnou hodnotou (duration nebo tempo)."""
+        for r in cands:
+            if r["src"].get("duration") or r["src"].get("tempo"):
+                return r
+        return None
+
+    def choose(cands: list[dict], a: str, a_na: str, title_unique: bool, na_mode: bool):
+        """Vybere kandidáta podle pravidel 1-3, jinak None.
+           na_mode=False: shoda interpreta přesná; True: shoda bez diacritiky."""
+        if a:
+            same = [r for r in cands if r["a"] and (r["a_na"] == a_na if na_mode else r["a"] == a)]
+            if same:
+                return pick(same)
+            noa = [r for r in cands if r["a"] == ""]
+            if noa and title_unique:
+                return pick(noa)
+            return None
+        # v knihovně není známý interpret – jen za jednoznačného názvu
+        if title_unique:
+            return pick(cands)
+        return None
+
+    for e, t, tna, a, a_na in specs:
+        src = None
+        cands_exact = (by_title.get(t) or []) if t else []
+        if cands_exact:
+            src = choose(cands_exact, a, a_na, lib_title_counts.get(t, 0) == 1, False)
+        elif tna and lib_title_na_counts.get(tna, 0) == 1:
+            # shoda bez diacritiky – jen při jednoznačné shodě v knihovně (bez kolize)
+            cands_na = by_title_na.get(tna) or []
+            src = choose(cands_na, a, a_na, lib_title_counts.get(t, 0) == 1, True)
+        if not src:
+            continue
+        s = src["src"]
+        # pouze doplnění chybějících hodnot – nikdy nepřepsat
+        if s.get("duration") and not e.get("duration"):
+            e["duration"] = s["duration"]
+        if s.get("tempo") and not e.get("tempo"):
+            e["tempo"] = s["tempo"]
 
 
 def enrich_imported_songs(imported: list[dict], library: list[dict]) -> tuple[list[dict], list[dict]]:
